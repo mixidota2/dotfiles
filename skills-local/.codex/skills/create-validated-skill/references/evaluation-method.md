@@ -114,11 +114,14 @@ final check after freezing. Do not manufacture three suites for every minor revi
 use separate selection data when actually choosing among candidates. A small pass
 establishes only the checked behavior, not statistical superiority.
 
-For a creator revision, run old and candidate creators on the same creation brief.
-Save their generated runtime packages and exact commits/hashes. Fresh consumers
-then solve the same unseen downstream tasks with those artifacts and a no-target-
-skill baseline. Consumers get task inputs and their assigned runtime skill, without
-the author's conversation, training logs, expected answers, or grader. A generator
+When evaluating a claim about the effectiveness of the creation method itself,
+compare the relevant creators (for example, old and candidate) on the same creation
+brief. Save their generated runtime packages and exact commits/hashes. Fresh consumers
+then solve the same unseen downstream tasks with those artifacts. Choose comparison
+arms for the question; add a no-target-skill baseline only when the claim needs it,
+not as an implicit third condition. Consumers get task inputs and their assigned
+runtime skill, without the author's conversation, training logs, expected answers,
+or grader. A generator
 producing a good-looking SKILL.md is only the first stage. The consumer's observable
 behavior and actual output establish whether that skill works. An independent
 coordinator should retain the original requirement checks and unseen fixtures.
