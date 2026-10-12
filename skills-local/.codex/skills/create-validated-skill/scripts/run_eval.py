@@ -6,9 +6,11 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,6 +29,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent.parent
 EXECUTOR_SCHEMA = ROOT / "assets" / "executor-output.schema.json"
 GRADER_SCHEMA = ROOT / "assets" / "semantic-grade.schema.json"
+TREE_DIGEST_FORMAT = "sha256-tree-manifest-v2"
 
 def load_yaml(path: Path) -> dict[str, Any]:
     if yaml is None:
@@ -137,7 +140,7 @@ def compact_run_record(run_record: dict[str, Any], skill_dir: Path) -> dict[str,
         "behavior_summary": run_record.get("behavior_summary", {}),
         "baseline_delta": run_record.get("baseline_delta", {}),
         "behavior_trials": behavior_trials,
-        **{key: run_record[key] for key in ("schema_version", "engine", "cli_version", "split", "candidate_sha256", "evaluation_sha256", "input_freeze", "decision", "decision_reasons", "case_comparisons", "limitations") if key in run_record},
+        **{key: run_record[key] for key in ("schema_version", "engine", "cli_version", "split", "tree_digest_format", "candidate_sha256", "evaluation_sha256", "input_freeze", "decision", "decision_reasons", "case_comparisons", "limitations") if key in run_record},
     }
 
 
@@ -189,19 +192,33 @@ def append_ledger(skill_dir: Path, run_record: dict[str, Any]) -> None:
 
 
 def digest(path):
-    """Hash bytes and relative names of the already filtered snapshot."""
-    h = hashlib.sha256()
-    if path.is_file():
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    for item in sorted(path.rglob("*")):
-        if item.is_symlink():
-            h.update(item.relative_to(path).as_posix().encode())
-            h.update(b"symlink-not-followed")
-        elif item.is_file():
-            h.update(item.relative_to(path).as_posix().encode())
-            h.update(b"\0")
-            h.update(item.read_bytes())
-    return h.hexdigest()
+    """Hash an unambiguous manifest of a staged tree, including empty directories."""
+    entries = []
+    items = [path]
+    while items:
+        item = items.pop()
+        mode = item.lstat().st_mode  # Never dereference a workspace symlink.
+        # Staging excludes these generated directories. Normal Python imports
+        # may recreate them; they are not source inputs. A same-name symlink or
+        # file is still hashed so replacing a directory with one is detectable.
+        if item != path and item.name == "__pycache__" and stat.S_ISDIR(mode):
+            continue
+        entry = {"path": item.relative_to(path).as_posix()}
+        if stat.S_ISLNK(mode):
+            entry.update(type="symlink", target=os.readlink(item))
+        elif stat.S_ISDIR(mode):
+            entry.update(type="directory", executable_bits=mode & 0o111)
+            items.extend(item.iterdir())
+        elif stat.S_ISREG(mode):
+            entry.update(type="file", executable_bits=mode & 0o111,
+                         sha256=hashlib.sha256(item.read_bytes()).hexdigest())
+        else:
+            raise ValueError(f"unsupported snapshot entry type: {entry['path']}")
+        entries.append(entry)
+    entries.sort(key=lambda entry: entry["path"])
+    manifest = {"format": TREE_DIGEST_FORMAT, "entries": entries}
+    encoded = json.dumps(manifest, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def safe_path(root, relative):
@@ -239,7 +256,7 @@ def freeze_inputs(skill, destination):
         root = Path(raw)
         stage_tree(skill, root / "candidate", skill=True)
         stage_tree(skill / "evals", root / "evaluation", evaluation=True)
-        record = {"version": 1, "created_at": utc_stamp(),
+        record = {"version": 2, "tree_digest_format": TREE_DIGEST_FORMAT, "created_at": utc_stamp(),
                   "candidate_sha256": digest(root / "candidate"),
                   "evaluation_sha256": digest(root / "evaluation")}
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -251,8 +268,10 @@ def freeze_inputs(skill, destination):
 
 def verify_frozen_inputs(path, candidate, evaluation):
     record = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(record, dict) or type(record.get("version")) is not int or record["version"] != 1:
+    if not isinstance(record, dict) or type(record.get("version")) is not int:
         raise ValueError("invalid input freeze record")
+    if record["version"] != 2 or record.get("tree_digest_format") != TREE_DIGEST_FORMAT:
+        raise ValueError("unsupported input freeze format; preserve the old record and re-freeze with --freeze-inputs to a new path (version 2 required)")
     for key, directory in (("candidate_sha256", candidate), ("evaluation_sha256", evaluation)):
         if record.get(key) != digest(directory):
             raise ValueError(f"frozen input mismatch: {key}; edits require a new experiment")
@@ -577,6 +596,7 @@ def main():
         if any(t["verdict"] == "review_required" for t in trials):
             reasons.append("Some requirements need independent qualitative review; legacy semantic-only evidence was not regraded.")
         record = {"schema_version": 3, "id": run_id, "mode": "behavior", "engine": args.engine,
+          "tree_digest_format": TREE_DIGEST_FORMAT,
           "cli_version": version, "model": args.model or "unresolved-default", "split": args.split,
           "results_dir": str(run_dir), "candidate_sha256": digest(frozen),
           "evaluation_sha256": evaluation_hash, "input_freeze": input_freeze, "routing_summary": {}, "routing_gates": {},

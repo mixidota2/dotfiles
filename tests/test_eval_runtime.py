@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -206,6 +207,82 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual([x['task'] for x in pattern['seen_in']], ['candidate', 'with_skill'])
 
 
+class SnapshotDigestTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_file_boundaries_cannot_alias_content_and_path_bytes(self):
+        single, multiple = self.root / 'single', self.root / 'multiple'
+        single.mkdir()
+        multiple.mkdir()
+        (single / 'a').write_bytes(b'payloadb\0second')
+        (multiple / 'a').write_bytes(b'payload')
+        (multiple / 'b').write_bytes(b'second')
+        self.assertNotEqual(r.digest(single), r.digest(multiple))
+
+    def test_empty_directories_and_entry_types_affect_identity(self):
+        empty = r.digest(self.root)
+        entry = self.root / 'a'
+        entry.mkdir()
+        directory = r.digest(self.root)
+        self.assertNotEqual(empty, directory)
+        entry.rmdir()
+        entry.touch()
+        self.assertNotEqual(r.digest(self.root), directory)
+
+    def test_each_execute_bit_affects_identity(self):
+        entry = self.root / 'helper.py'
+        entry.write_text('print("hello")')
+        entry.chmod(0o644)
+        original = r.digest(self.root)
+        for mode in (0o744, 0o654, 0o645, 0o755):
+            entry.chmod(mode)
+            self.assertNotEqual(r.digest(self.root), original)
+
+    def test_relocation_and_creation_order_do_not_affect_identity(self):
+        first, second = self.root / 'first', self.root / 'second'
+        first.mkdir()
+        second.mkdir()
+        names = ('a', 'quote"newline\n日本語')
+        for directory, order in ((first, names), (second, reversed(names))):
+            for name in order:
+                entry = directory / name
+                entry.write_text(name)
+                entry.chmod(0o644)
+        self.assertEqual(r.digest(first), r.digest(second))
+
+    def test_symlink_target_is_hashed_without_dereferencing(self):
+        link = self.root / 'link'
+        link.symlink_to('missing-one')
+        first = r.digest(self.root)
+        link.unlink()
+        link.symlink_to('missing-two')
+        self.assertNotEqual(r.digest(self.root), first)
+        self.assertNotEqual(r.digest(link), r.digest(self.root))
+        link.unlink()
+        link.symlink_to('missing//two')
+        literal = r.digest(self.root)
+        link.unlink()
+        link.symlink_to('missing/two')
+        self.assertNotEqual(r.digest(self.root), literal)
+
+    def test_cache_directory_is_excluded_but_same_name_file_or_link_is_not(self):
+        original = r.digest(self.root)
+        cache = self.root / '__pycache__'
+        cache.mkdir()
+        (cache / 'helper.cpython.pyc').write_bytes(b'generated')
+        self.assertEqual(r.digest(self.root), original)
+        (cache / 'helper.cpython.pyc').unlink()
+        cache.rmdir()
+        cache.write_text('not a cache directory')
+        self.assertNotEqual(r.digest(self.root), original)
+        cache.unlink()
+        cache.symlink_to('missing')
+        self.assertNotEqual(r.digest(self.root), original)
+
+
 class FrozenInputTests(unittest.TestCase):
     """Exercise the full runner with fake transport; never start an agent CLI."""
     def setUp(self):
@@ -262,6 +339,8 @@ class FrozenInputTests(unittest.TestCase):
         self.assertEqual((result[0], result[3], result[4]), (3, 1, 2), result)
         summary = r.load_yaml(Path(json.loads(result[1])['results_dir']) / 'summary.yaml')
         self.assertEqual(summary['input_freeze'], json.loads(before))
+        self.assertEqual(summary['input_freeze']['version'], 2)
+        self.assertEqual(summary['tree_digest_format'], r.TREE_DIGEST_FORMAT)
         self.assertEqual(summary['decision'], 'inconclusive')
         # Appending evidence/ledger must not invalidate the source input record.
         again = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=self.execute)
@@ -303,5 +382,86 @@ class FrozenInputTests(unittest.TestCase):
         result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=mutate)
         self.assertEqual(result[0], 2, result)
         self.assertIn('contaminated run', result[2])
+
+    def test_old_or_unknown_freeze_format_requires_new_record_before_cli(self):
+        record = json.loads(self.freeze())
+        for version, digest_format in ((1, r.TREE_DIGEST_FORMAT), (3, r.TREE_DIGEST_FORMAT), (2, 'unknown')):
+            self.lock.write_text(json.dumps({**record, 'version': version, 'tree_digest_format': digest_format}))
+            result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock))
+            self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+            self.assertIn('re-freeze with --freeze-inputs to a new path', result[2])
+
+    def test_changed_execute_bit_or_empty_directory_blocks_before_cli(self):
+        source = self.skill / 'evals/fixtures/input/input.txt'
+        source.chmod(0o644)
+        self.freeze()
+        source.chmod(0o755)
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock))
+        self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+        self.assertIn('frozen input mismatch', result[2])
+        source.chmod(0o644)
+        (source.parent / 'empty').mkdir()
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock))
+        self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+        self.assertIn('frozen input mismatch', result[2])
+
+    def setup_importing_grader(self, mutate_source=False):
+        graders = self.skill / 'evals/graders'
+        graders.mkdir()
+        (graders / 'helper.py').write_text('VALUE = 42\n')
+        (graders / 'check.py').write_text(
+            'import os, helper\nfrom pathlib import Path\n'
+            'assert "PYTHONDONTWRITEBYTECODE" not in os.environ\n'
+            'assert helper.VALUE == 42\n'
+            'assert list((Path(__file__).parent / "__pycache__").glob("helper.*.pyc"))\n'
+            + ('Path(helper.__file__).write_text("VALUE = 99\\n")\n' if mutate_source else ''))
+        task_path = self.skill / 'evals/tasks/final.yaml'
+        task = r.load_yaml(task_path)
+        task['requirements'][0]['objective'] = [{'kind': 'command', 'argv': [
+            r.sys.executable, '{eval_root}/graders/check.py']}]
+        r.write_yaml(task_path, task)
+
+    def test_real_grader_import_cache_does_not_contaminate_frozen_inputs(self):
+        self.setup_importing_grader()
+        self.freeze()
+        with mock.patch.dict(os.environ):
+            os.environ.pop('PYTHONDONTWRITEBYTECODE', None)
+            result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=self.execute)
+        self.assertEqual(result[0], 3, result)
+        summary = r.load_yaml(Path(json.loads(result[1])['results_dir']) / 'summary.yaml')
+        self.assertEqual(summary['behavior_summary']['candidate']['passed'], 1)
+
+    def test_real_grader_source_mutation_remains_contamination(self):
+        self.setup_importing_grader(mutate_source=True)
+        self.freeze()
+        with mock.patch.dict(os.environ):
+            os.environ.pop('PYTHONDONTWRITEBYTECODE', None)
+            result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=self.execute)
+        self.assertEqual(result[0], 2, result)
+        self.assertIn('contaminated run', result[2])
+
+    def test_real_runtime_helper_import_cache_is_allowed_but_source_mutation_is_not(self):
+        scripts = self.skill / 'scripts'
+        scripts.mkdir()
+        (scripts / 'helper.py').write_text('VALUE = 42\n')
+        self.freeze()
+        for mutate in (False, True):
+            def execute(**kw):
+                runtime = kw['workspace'].parent / 'runtime-skill/sample/scripts'
+                env = dict(os.environ)
+                env.pop('PYTHONDONTWRITEBYTECODE', None)
+                subprocess.run([r.sys.executable, '-c', 'import helper; assert helper.VALUE == 42'],
+                               cwd=runtime, env=env, check=True, capture_output=True)
+                self.assertTrue(list((runtime / '__pycache__').glob('helper.*.pyc')))
+                if mutate:
+                    (runtime / 'helper.py').write_text('VALUE = 99\n')
+                return self.execute(**kw)
+            result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=execute)
+            self.assertEqual(result[0], 2 if mutate else 3, result)
+            summary = r.load_yaml(Path(json.loads(result[1])['results_dir']) / 'summary.yaml')
+            if mutate:
+                self.assertIn('staged runtime skill changed', summary['behavior_trials'][0]['output_error'])
+            else:
+                self.assertEqual(summary['behavior_summary']['candidate']['passed'], 1)
 
 if __name__=='__main__': unittest.main()

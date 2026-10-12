@@ -75,6 +75,24 @@ Input snapshots are also checked after execution. These checks detect input chan
 not whether the author previously saw a case or regenerated the record. They do not
 replace separation of author and consumer or an independently retained holdout.
 
+Freeze records now use version 2 and `tree_digest_format: sha256-tree-manifest-v2`.
+Tree hashes use canonical JSON (sorted keys, compact separators, ASCII escaping)
+of entries sorted by relative POSIX path, including the root as `.`. Each entry
+records its path and type; files include a content SHA256 and owner/group/other
+execute bits, and directories include execute bits. Empty directories are included
+because their presence can affect a task. Symlinks record their literal target
+without following it (staged inputs still reject symlinks); special files are rejected.
+As in staging, generated `__pycache__` directories are excluded, including those
+created by normal grader/runtime-helper imports. Within staged snapshots, source
+`.py` changes, new bytecode outside these directories, and same-name files or
+symlinks remain detectable.
+Absolute locations, timestamps, ownership, and read/write permission bits are not
+part of this portable identity. Summaries/ledgers label the tree hash format too;
+scenario/settings hashes retain their existing definitions. Version-1 or unknown
+freeze formats fail before CLI startup, even if digest strings match. Preserve old
+records and run `--freeze-inputs` to a new path; this creates a new freeze event and
+does not retroactively strengthen an earlier experiment's evidence.
+
 Omit `--previous-skill` for new skills. `--baseline` includes no-target-skill;
 revisions automatically include it. `--case ID` narrows cases; `--trials N` repeats
 fresh matched trials. `--binary` selects an existing official CLI. The runner is a
