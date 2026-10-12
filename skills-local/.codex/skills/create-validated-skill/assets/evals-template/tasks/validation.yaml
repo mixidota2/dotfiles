@@ -1,0 +1,11 @@
+id: validation
+kind: validation
+scenario: |
+  TODO Write selection cases that do not drive individual edits.
+requirements:
+  - id: TODO-requirement-id
+    critical: true
+    description: TODO Define an independent observable outcome.
+    objective:
+      - kind: contains
+        value: TODO Replace with an exact outcome check or external artifact verifier.

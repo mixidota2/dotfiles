@@ -1,11 +1,15 @@
 name: TODO-skill-name
-version: 2
+version: 3
 tier: standard
 trials_per_task: 1
 tasks:
   - tasks/typical.yaml
   - tasks/edge.yaml
   - tasks/negative.yaml
+validation:
+  - tasks/validation.yaml
+holdout:
+  - tasks/holdout.yaml
 routing:
   profiles:
     - isolated

@@ -243,6 +243,13 @@ herdr integration status
 herdr integration install <agent>
 ```
 
+### Updating Homebrew Installations
+
+This dotfiles repository installs Herdr through Homebrew. Use `brew upgrade herdr`
+to update it. `herdr update`, channel switching, and update-time live handoff are
+for Herdr-managed direct installations, not Homebrew installations. See the
+[official install and update instructions](https://herdr.dev/docs/install/).
+
 ### Live Handoff
 
 Experimental opt-in for updates or remote attach flows that replace a running server while trying to keep pane processes alive:
