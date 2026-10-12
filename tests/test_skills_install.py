@@ -32,7 +32,8 @@ class SkillsInstallTests(unittest.TestCase):
             ["/bin/sh", str(REPO / "skills/install.sh")],
             env={
                 "HOME": str(self.home),
-                "PATH": str(self.bin),
+                "PATH": str(self.bin) + ":/usr/bin:/bin:/usr/sbin:/sbin",
+                "DOTFILES_BACKUP_DIR": str(self.root / "backups"),
                 "NPX_ARGS_FILE": str(self.args_file),
                 "NPX_EXIT_CODE": str(exit_code),
             },
@@ -44,15 +45,83 @@ class SkillsInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.args_file.read_text().splitlines(), [
             "skills", "add", "mixidota2/tasukura-skills",
-            "--global", "--agent", "codex", "--copy", "--yes", "--skill", "tk",
+            "--global", "--agent", "codex", "claude-code", "--copy", "--yes", "--skill", "tk",
         ])
-        self.assertIn("tk skill installed.", result.stdout)
+        self.assertIn("tk skill installed for Codex and Claude Code.", result.stdout)
         self.assertEqual(list(self.home.iterdir()), [])
 
     def test_failed_install_does_not_report_success(self):
         result = self.install(exit_code=17)
         self.assertEqual(result.returncode, 17)
         self.assertNotIn("tk skill installed", result.stdout)
+
+    def test_existing_claude_skill_is_preserved_in_unique_backup(self):
+        target = self.home / ".claude/skills/tk"
+        target.mkdir(parents=True)
+        (target / "custom.txt").write_text("local customization")
+        backup = self.root / "backups/.claude/skills/tk"
+        backup.mkdir(parents=True)
+        (backup / "old.txt").write_text("previous backup")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((backup / "old.txt").read_text(), "previous backup")
+        self.assertEqual((backup.with_name("tk.1") / "custom.txt").read_text(), "local customization")
+
+    def test_relative_symlink_backup_retains_original_referent(self):
+        target = self.home / ".claude/skills/tk"
+        target.parent.mkdir(parents=True)
+        source = self.home / ".claude/original-tk"
+        source.mkdir()
+        (source / "SKILL.md").write_text("original")
+        target.symlink_to("../original-tk")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        backup = self.root / "backups/.claude/skills/tk"
+        self.assertTrue(backup.is_symlink())
+        self.assertEqual((backup / "SKILL.md").read_text(), "original")
+        self.assertEqual((source / "SKILL.md").read_text(), "original")
+
+    def test_failed_install_restores_customizations(self):
+        target = self.home / ".claude/skills/tk"
+        target.mkdir(parents=True)
+        (target / "custom.txt").write_text("preserved")
+        result = self.install(exit_code=17)
+        self.assertEqual(result.returncode, 17)
+        self.assertIn("restored", result.stderr)
+        self.assertEqual((target / "custom.txt").read_text(), "preserved")
+
+    def test_failure_preserves_partial_replacement_and_occupied_backup(self):
+        target = self.home / ".claude/skills/tk"
+        target.mkdir(parents=True)
+        (target / "custom.txt").write_text("original")
+        failed = self.root / "backups/.claude/skills/tk.failed-install"
+        failed.mkdir(parents=True)
+        (failed / "old.txt").write_text("older failure")
+        self.npx.write_text(
+            '#!/bin/sh\nmkdir -p "$HOME/.claude/skills/tk"\n'
+            'printf partial > "$HOME/.claude/skills/tk/partial.txt"\nexit 19\n'
+        )
+        result = self.install()
+        self.assertEqual(result.returncode, 19)
+        self.assertEqual((target / "custom.txt").read_text(), "original")
+        self.assertEqual((failed / "old.txt").read_text(), "older failure")
+        self.assertEqual((failed.with_name("tk.failed-install.1") / "partial.txt").read_text(), "partial")
+        self.assertIn("restored", result.stderr)
+        self.assertNotIn("tk skill installed", result.stdout)
+
+    def test_whole_skills_symlink_stops_before_npx_or_source_changes(self):
+        source = self.root / "shared skills"
+        source.mkdir()
+        (source / "SKILL.md").write_text("unchanged")
+        skills = self.home / ".claude/skills"
+        skills.parent.mkdir()
+        skills.symlink_to(source)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("skills root is a symlink", result.stderr)
+        self.assertFalse(self.args_file.exists())
+        self.assertEqual((source / "SKILL.md").read_text(), "unchanged")
+        self.assertTrue(skills.is_symlink())
 
     def test_missing_npx_fails_before_install(self):
         self.npx.unlink()

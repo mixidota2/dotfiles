@@ -1,6 +1,6 @@
 # dotfiles
 
-Personal macOS configuration for zsh, cmux, WezTerm, Neovim, Herdr, Orca, Pi, Codex, tk, and local agent skills.
+Personal macOS configuration for zsh, cmux, WezTerm, Neovim, Herdr, Orca, Pi, Codex, Claude Code, tk, and local agent skills.
 
 ## Install
 
@@ -26,7 +26,9 @@ Install Homebrew dependencies and user-level CLI tools on a fresh machine with:
 
 Homebrew must already be installed. Add `--dry-run` to preview tool commands; `uv` can be absent during the preview because the Brewfile provides it.
 
-Restore the external [tk skill](https://github.com/mixidota2/tasukura-skills) separately (requires `npx`):
+Claude Code is included in the macOS Homebrew installation. See [Claude Code setup](docs/claude-code.md) for skill sharing, updates, and verification.
+
+Restore the external [tk skill](https://github.com/mixidota2/tasukura-skills) for Codex and Claude Code separately (`./install.sh --tools` provides Node.js/npm and `npx` through Homebrew):
 
 ```sh
 ./skills/install.sh
@@ -36,7 +38,7 @@ Restore the external [tk skill](https://github.com/mixidota2/tasukura-skills) se
 
 Files in this repository are the source of truth. Paths such as `~/.config/wezterm/wezterm.lua` are symbolic links into this repository, so normal edits appear directly in `git diff`.
 
-Runtime state and credentials are intentionally excluded. In particular, Codex configuration and authentication, Pi authentication, sessions, histories, caches, SQLite databases, Herdr sessions, and `~/.local/share/tk/tasks.db` are not managed here.
+Runtime state and credentials are intentionally excluded. In particular, Codex configuration and authentication, Pi authentication, Claude Code settings and authentication, sessions, histories, caches, SQLite databases, Herdr sessions, and `~/.local/share/tk/tasks.db` are not managed here.
 
 The installer skips `.DS_Store`, `__pycache__` directories, and Python bytecode (`*.pyc` and `*.pyo`) generated inside the checkout. Other configuration files, including dotfiles and new files, remain installable.
 
@@ -57,6 +59,7 @@ This repository starts from a reviewed file snapshot with a fresh Git history. P
 - `orca`: `~/.orca/keybindings.json` only; other Orca settings, sessions, and credentials remain local. See [the macOS shortcut mapping](docs/orca-shortcuts.md).
 - `pi`: global instructions, preferences, and custom extensions.
 - `codex`: global `AGENTS.md` instructions and reusable approval rules. `~/.codex/config.toml`, including project trust and generated settings, remains local to each computer.
+- Claude Code: individual links to the six local skill directories under `~/.claude/skills`; settings, authentication, account-synced skills, and other user skills remain local.
 - `tk`: configuration only. The CLI is installed as a uv tool and its task database remains local.
 - `skills-local`: locally maintained skills. The external tk skill is restored by `skills/install.sh`.
 

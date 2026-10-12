@@ -34,6 +34,7 @@ class InstallerPortabilityTests(unittest.TestCase):
             "pi/.pi/agent/AGENTS.md": ".pi/agent/AGENTS.md",
             "codex/.codex/AGENTS.md": ".codex/AGENTS.md",
             "tk/.config/tk/config.toml": ".config/tk/config.toml",
+            "skills-local/.codex/skills/new-skill/SKILL.md": ".codex/skills/new-skill/SKILL.md",
             "skills-local/.codex/skills/new-skill/.settings": ".codex/skills/new-skill/.settings",
             "skills-local/.codex/skills/new-skill/scripts/fresh.py": ".codex/skills/new-skill/scripts/fresh.py",
             "shell/.config/new-tool/new file.json": ".config/new-tool/new file.json",
@@ -47,7 +48,7 @@ class InstallerPortabilityTests(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         # Only required OS utilities are exposed, never a host brew, uv or tk.
-        for name in ("cat", "date", "dirname", "find", "readlink", "mkdir", "mv", "ln"):
+        for name in ("cat", "date", "dirname", "find", "readlink", "mkdir", "mv", "ln", "rm"):
             source = shutil.which(name, path=SYSTEM_PATH)
             self.assertIsNotNone(source, name)
             (self.bin / name).symlink_to(source)
@@ -100,6 +101,7 @@ class InstallerPortabilityTests(unittest.TestCase):
             for source, destination in self.files.items()
         }
         expected[str(self.home / ".pi/agent/skills")] = str(self.home / ".codex/skills")
+        expected[str(self.home / ".claude/skills/new-skill")] = str(self.repo / "skills-local/.codex/skills/new-skill")
         preview = self.install("--dry-run")
         self.assertEqual(preview.returncode, 0, preview.stderr)
         planned = [line for line in preview.stdout.splitlines() if line.startswith("link    ")]

@@ -1,6 +1,7 @@
 """Installer regressions. Every invocation uses an isolated temporary HOME."""
 
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -38,6 +39,15 @@ class InstallTests(unittest.TestCase):
     def assert_orca_linked(self):
         self.assertTrue(self.target.is_symlink())
         self.assertEqual(os.readlink(self.target), str(REPO / "orca" / ORCA))
+
+    def test_orca_install_uses_official_qualified_cask(self):
+        brewfile = (REPO / "Brewfile").read_text()
+        taps = re.findall(r'^\s*tap\s+[\"\']([^\"\']+)[\"\']', brewfile, re.MULTILINE)
+        casks = re.findall(r'^\s*cask\s+[\"\']([^\"\']+)[\"\']', brewfile, re.MULTILINE)
+        self.assertEqual(taps.count("stablyai/orca"), 1)
+        self.assertEqual(casks.count("stablyai/orca/orca"), 1)
+        # The bare core cask is a different, disabled Plotly application.
+        self.assertNotIn("orca", casks)
 
     def test_install_links_orca_and_preserves_other_orca_files(self):
         settings = self.target.parent / "settings.json"

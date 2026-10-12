@@ -29,7 +29,9 @@ Existing Ctrl+1–9 tab selection and Cmd+Option+arrow pane cycling also remain 
 
 ## Install and existing settings
 
-`./install.sh --dry-run` now includes `~/.orca/keybindings.json`. The normal installer links that one file. It does not install the Orca application or manage the rest of `~/.orca`.
+`./install.sh --dry-run` includes `~/.orca/keybindings.json`. The normal installer links that one file and does not manage the rest of `~/.orca`.
+
+Use `./install.sh --tools` to also install the Orca application through the official `stablyai/orca` Homebrew tap and the fully qualified `stablyai/orca/orca` cask in the Brewfile. This follows [Orca’s official installation instructions](https://www.onorca.dev/docs/install). Keep the qualified cask name: the unrelated Homebrew core `orca` cask is the Plotly image-export application. The vendor cask installs `Orca.app` and its bundled `orca` CLI. First-launch permissions and optional imports remain interactive app setup.
 
 If a local keybindings file or symlink already exists, the installer backs it up before linking the repository version. It does not merge local-only shortcuts into this file. Compare the dry-run output and your current file before installing if you have additional overrides. Existing backups are preserved using `.1`, `.2`, and subsequent suffixes when needed. Re-running against the correct symlink does nothing.
 
