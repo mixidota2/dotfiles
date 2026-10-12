@@ -10,7 +10,7 @@ usage() {
 Usage: ./install.sh [--dry-run] [--tools]
 
   --dry-run  Print filesystem changes and tool commands without applying them.
-  --tools    Install Homebrew dependencies and tk as a uv tool when missing.
+  --tools    Install Homebrew dependencies (including Claude Code) and tk.
 EOF
 }
 
@@ -23,6 +23,13 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# Never write through a whole-directory Claude skills link into another app or
+# the checkout. Per-skill links are supported; inspect/migrate this root first.
+if [ -L "$HOME/.claude/skills" ]; then
+  printf 'Claude skills root is a symlink: %s. Inspect it and use a real skills directory before installing.\n' "$HOME/.claude/skills" >&2
+  exit 1
+fi
 
 timestamp=$(date '+%Y%m%d-%H%M%S')
 backup_root=${DOTFILES_BACKUP_DIR:-"$HOME/.dotfiles-backups/$timestamp"}
@@ -41,9 +48,18 @@ link_file() {
   source=$1
   relative=${source#"$repo_dir/"}
   relative=${relative#*/}
+  link_path "$source" "$relative"
+}
+
+link_path() {
+  source=$1
+  relative=$2
   destination=$HOME/$relative
 
-  if [ -L "$destination" ] && [ "$(readlink "$destination")" = "$source" ]; then
+  # A parent directory can itself link into the checkout. Never move a source
+  # file/directory onto its own backup or replace it with a self-link.
+  if [ "$destination" -ef "$source" ] ||
+     { [ -L "$destination" ] && [ "$(readlink "$destination")" = "$source" ]; }; then
     printf 'linked  %s\n' "$destination"
     return
   fi
@@ -58,7 +74,17 @@ link_file() {
     done
     printf 'backup  %s -> %s\n' "$destination" "$backup"
     run mkdir -p "$(dirname "$backup")"
-    run mv "$destination" "$backup"
+    if [ -L "$destination" ]; then
+      target=$(readlink "$destination")
+      case "$target" in
+        /*) ;;
+        *) target=$(dirname "$destination")/$target ;;
+      esac
+      run ln -s "$target" "$backup"
+      run rm "$destination"
+    else
+      run mv "$destination" "$backup"
+    fi
   fi
 
   printf 'link    %s -> %s\n' "$destination" "$source"
@@ -99,6 +125,14 @@ install_user_tools() {
 
 for package in shell cmux wezterm yazi nvim herdr orca pi codex tk skills-local; do
   link_package "$package"
+done
+
+# Keep Claude's skills directory independent so local/account-synced skills remain.
+# Only directories containing SKILL.md are discoverable skills, not support files.
+for skill_dir in "$repo_dir"/skills-local/.codex/skills/*; do
+  [ -f "$skill_dir/SKILL.md" ] || continue
+  skill_name=${skill_dir##*/}
+  link_path "$skill_dir" ".claude/skills/$skill_name"
 done
 
 # Pi and Codex share one skill installation.

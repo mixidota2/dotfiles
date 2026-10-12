@@ -1,4 +1,6 @@
 brew "uv"
+# npm/npx are used by the external skill installer, not by native Claude Code.
+brew "node"
 brew "yazi"
 brew "mise"
 brew "hunk"
@@ -10,6 +12,10 @@ brew "gh"
 brew "fd"
 brew "ripgrep"
 
+tap "stablyai/orca"
+
 cask "cmux"
 cask "codex"
+cask "claude-code"
 cask "wezterm@nightly"
+cask "stablyai/orca/orca"
