@@ -9,8 +9,11 @@ Official practical guidance and empirical findings answer different questions:
   a valid purpose even when the model can already perform the component tasks.
   Its [creator](https://github.com/anthropics/skills/blob/main/skills/skill-creator/SKILL.md)
   starts from intent; execution history is one source, not an eligibility condition.
+  It compares new skills against no skill and revisions against the old version,
+  runs independent arms in parallel, and treats blind comparison as optional.
 - [OpenAI's evaluation guide](https://developers.openai.com/blog/eval-skills)
-  separates outcome, process, style, and efficiency checks and starts small.
+  separates outcome, process, style, and efficiency checks, starts with focused
+  deterministic checks, and adds heavier checks when they reduce a relevant risk.
   The [Codex creator](https://github.com/openai/codex/blob/main/codex-rs/skills/src/assets/samples/skill-creator/SKILL.md)
   also works from intended uses and concrete examples.
 - [SkillLens](https://arxiv.org/html/2605.23899) studies experience extraction and
@@ -25,10 +28,15 @@ Official practical guidance and empirical findings answer different questions:
 - [Evaluation/evolution survey](https://arxiv.org/html/2606.11435v1) describes gaps
   across creation, retrieval, task utility, and operational cost. These are distinct
   evidence needs, not a mandate to reproduce every benchmark.
+- [Dynamic Agent Skills, Yubo Li, v1 (2026-07-11)](https://arxiv.org/html/2607.10113v1)
+  discusses staged admission and the limited observation scope of each verifier:
+  passing a narrow contract does not establish general transfer.
 
 Our design inference is to preserve required intent first, ground conditional
 instructions in known inputs, and test both the generated artifact and its use.
 No cited paper proves this repository's creator improves a particular model.
+These sources do not establish a universal trial count or time limit. Our practical
+choice is to scale checks with the change, preserving the user's must-pass intent.
 
 ## Draft from intent, experience, or both
 
@@ -68,11 +76,32 @@ version into `skills-local/.codex/skills` in a reviewed change. Installation is 
 separate authorized action. Reject/blocked/inconclusive candidates stay isolated.
 Do not mark all existing skills or uninstall accepted versions as a migration.
 
-Use matched no-target-skill/candidate arms for new skills and also the accepted
-version for revisions. Pin model and match task inputs, tools, permissions, limits,
-and settings. Preserve the initial draft if studying optimization. Start small;
-repeat only where variability or risk matters. Do not substitute a favorable
-aggregate for a case-level regression.
+Use matched candidate/no-target-skill arms for new skills and candidate/accepted
+version for revisions. Add no-target-skill to a revision only when needed for the
+claim, such as continued value over the base agent or studying the creation method.
+Pin model and match inputs, tools, permissions, limits, and settings. Preserve the
+initial draft if studying optimization. Repeat only where variability or risk matters.
+Do not substitute a favorable aggregate for a case-level regression.
+
+## Choose checks proportional to the change
+
+- Every change gets cheap structure checks and relevant script tests. If the diff
+  preserves intent, triggers, required/prohibited behavior, and output, record that
+  reason for omitting behavior runs. Wording that changes meaning is behavioral.
+- Behavior changes start with fresh-consumer smoke covering the changed requirements
+  and critical existing behavior. Use deterministic grading where sufficient; add
+  independent qualitative review only for properties those checks cannot establish.
+- New capabilities, major revisions, high-risk actions, model/tool changes, or smoke
+  disagreement warrant broader cases and comparisons. Native routing is separately
+  tested when triggers/discovery change or a known routing interaction needs checking.
+
+Reuse cases and checks whose assumptions remain valid; do not rerun unaffected
+suites without a reason. Record what ran, coverage, omissions and why, remaining
+uncertainty, and the adoption scope in existing notes/records. Must-pass failure
+stops promotion, not the honest recording of other authorized independent checks.
+An interrupted or budget-limited experiment leaves missing evidence unjudged.
+Infrastructure failure is blocked; insufficient evidence is inconclusive. Neither
+justifies adoption, automatic retry until green, or removing a required procedure.
 
 ## Author-to-consumer test and data separation
 
@@ -80,6 +109,10 @@ Development may inform edits; validation selects among candidates; final unseen
 cases test the selected frozen artifact. Vary inputs, names, paths, schemas, and
 legitimate solutions. Once a final case informs an edit, retain it as regression
 data and obtain a fresh final case. Do not relabel reused tests as unseen.
+For a single uniterated candidate, an untouched targeted smoke case can be the scoped
+final check after freezing. Do not manufacture three suites for every minor revision;
+use separate selection data when actually choosing among candidates. A small pass
+establishes only the checked behavior, not statistical superiority.
 
 For a creator revision, run old and candidate creators on the same creation brief.
 Save their generated runtime packages and exact commits/hashes. Fresh consumers
@@ -89,6 +122,9 @@ the author's conversation, training logs, expected answers, or grader. A generat
 producing a good-looking SKILL.md is only the first stage. The consumer's observable
 behavior and actual output establish whether that skill works. An independent
 coordinator should retain the original requirement checks and unseen fixtures.
+This creation-method experiment is not a mandatory second pipeline for routine
+skill maintenance. Existing results remain tied to their exact authoring commit;
+later authoring changes require their own scoped evidence.
 
 `run_eval.py --freeze-inputs` records candidate/evaluation hashes without a model
 call. Holdout requires `--frozen-inputs`; mismatches stop before CLI startup. Keep
@@ -98,6 +134,14 @@ runner stages runtime files without evals/history and fixtures without graders;
 this is data hygiene, not filesystem isolation. Global skills can still contaminate
 arms, so automatic adoption remains disabled. Independent cloud tasks are suitable
 when a nested CLI cannot start; never change authentication/security to force it.
+
+The runner supports case selection and separate result records, but has no automatic
+resume, result cache, or parallel scheduler. Use `--case` for scoped runs; a rerun
+creates new evidence rather than resuming or overwriting a previous trial. Independent
+cloud tasks can run in parallel when supported, with separate workspaces and matched
+settings. Do not parallelize edits with their dependent validation or interpret lower
+wall time as fewer model calls. Distinguish local check time, agent invocations/API
+usage, and end-to-end time including environment startup and artifact transfer.
 
 ## Measure and report the claim actually tested
 

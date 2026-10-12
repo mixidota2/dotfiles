@@ -346,6 +346,72 @@ class FrozenInputTests(unittest.TestCase):
         again = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=self.execute)
         self.assertEqual(again[0], 3, again)
 
+    def test_comparison_arms_are_explicit_and_revisions_need_only_two(self):
+        self.freeze()
+        previous = ('--previous-skill', str(self.skill))
+        for options, arms, comparisons in (
+            ((), {'candidate'}, set()),
+            (('--baseline',), {'candidate', 'no_skill'}, {'no_skill'}),
+            (previous, {'candidate', 'previous'}, {'previous'}),
+            ((*previous, '--baseline'), {'candidate', 'previous', 'no_skill'}, {'previous', 'no_skill'}),
+        ):
+            with self.subTest(options=options):
+                result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock),
+                                       *options, execute=self.execute)
+                self.assertEqual((result[0], result[4]), (3, len(arms)), result)
+                summary = json.loads(result[1])
+                self.assertEqual(set(summary['behavior_summary']), arms)
+                self.assertEqual({item['against'] for item in summary['case_comparisons']}, comparisons)
+                self.assertEqual(summary['decision'], 'inconclusive')
+
+    def test_case_selection_and_explicit_repetitions_do_not_expand_other_cases(self):
+        second = r.load_yaml(self.skill / 'evals/tasks/final.yaml')
+        second['id'] = 'second'
+        r.write_yaml(self.skill / 'evals/tasks/second.yaml', second)
+        r.write_yaml(self.skill / 'evals/eval.yaml', {
+            'name': 'sample', 'version': 3, 'holdout': ['tasks/final.yaml', 'tasks/second.yaml']})
+        self.freeze()
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock),
+                               '--previous-skill', str(self.skill), '--case', 'second',
+                               '--trials', '2', execute=self.execute)
+        self.assertEqual((result[0], result[4]), (3, 4), result)
+        summary = json.loads(result[1])
+        self.assertEqual({item['task'] for item in summary['case_comparisons']}, {'second'})
+        self.assertEqual({item['trial'] for item in summary['case_comparisons']}, {1, 2})
+
+    def test_must_pass_failure_rejects_candidate_and_preserves_independent_arm(self):
+        self.freeze()
+        def execute(**kw):
+            result = self.execute(**kw)
+            if kw['workspace'].parents[1].name == 'candidate':
+                kw['output'].write_text(json.dumps({'deliverable': 'Wrong answer.'}))
+            return result
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock),
+                               '--previous-skill', str(self.skill), execute=execute)
+        self.assertEqual((result[0], result[4]), (1, 2), result)
+        summary = json.loads(result[1])
+        self.assertEqual(summary['decision'], 'reject_candidate')
+        self.assertEqual(summary['behavior_summary']['candidate']['failed'], 1)
+        self.assertEqual(summary['behavior_summary']['previous']['passed'], 1)
+        self.assertEqual(summary['case_comparisons'][0]['critical_regressions'], ['exact'])
+
+    def test_timeout_is_unjudged_even_when_another_arm_passes(self):
+        self.freeze()
+        def execute(**kw):
+            result = self.execute(**kw)
+            if kw['workspace'].parents[1].name == 'candidate':
+                result['exit_code'] = 124
+            return result
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock),
+                               '--previous-skill', str(self.skill), execute=execute)
+        self.assertEqual((result[0], result[4]), (2, 2), result)
+        summary = json.loads(result[1])
+        self.assertEqual(summary['decision'], 'blocked')
+        self.assertEqual(summary['behavior_summary']['candidate']['passed'], 0)
+        self.assertEqual(summary['behavior_summary']['candidate']['errors'], 1)
+        self.assertEqual(summary['behavior_summary']['previous']['passed'], 1)
+        self.assertEqual(summary['case_comparisons'][0]['result'], 'inconclusive')
+
     def test_changed_runtime_case_fixture_or_grader_blocks_before_cli(self):
         grader = self.skill / 'evals/graders/check.py'
         grader.parent.mkdir()

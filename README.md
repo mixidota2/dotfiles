@@ -97,11 +97,16 @@ The portable-checks workflow runs the tests, evaluator self-test, and `/bin/sh -
 
 The shared creation skill supports Codex and Claude Code CLI adapters. Package
 compatibility, stubbed adapter tests, and real behavioral validation are separate
-claims. Use matched no-skill/previous/candidate fixtures and independent outcome
-checks; the runner never installs a candidate or configures authentication.
+claims. Start with cheap checks and targeted behavior smoke. Compare candidate
+against no-skill for new skills, or the previous version for revisions; explicitly
+request all three only when the claim needs them. Broaden coverage according to
+risk and observed failures. Use independent outcome checks; the runner never
+installs a candidate or configures authentication.
 Legacy semantic-only suites and historical ledgers are preserved, not silently
 regraded. See [the evaluation method](skills-local/.codex/skills/create-validated-skill/references/evaluation-method.md)
 and [CLI/schema](skills-local/.codex/skills/create-validated-skill/references/evaluation-schema.md).
 Infrastructure failure is blocked; missing evidence or unverified global skill
 isolation is inconclusive. Passing unit tests does not prove skills improve either
 agent.
+See the [cost audit and scoped Codex follow-up](docs/skill-validation-cost.md) for
+measured local overhead, invocation counts, and the unrun real-agent smoke plan.

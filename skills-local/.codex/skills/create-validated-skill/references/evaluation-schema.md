@@ -58,8 +58,11 @@ selection, invalid output, missing completed trace, and executor errors fail clo
 
 ```sh
 python3 scripts/validate_skill.py /path/to/skill
+# Routine revision: candidate versus previous, scoped to the affected case.
 python3 scripts/run_eval.py /path/to/candidate --engine codex --model MODEL \
-  --baseline --previous-skill /path/to/previous --split validation
+  --previous-skill /path/to/previous --case AFFECTED_CASE
+# New skill: candidate versus no skill.
+python3 scripts/run_eval.py /path/to/candidate --engine codex --model MODEL --baseline
 python3 scripts/run_eval.py /path/to/candidate --freeze-inputs /path/to/experiment/frozen-inputs.json
 python3 scripts/run_eval.py /path/to/candidate --engine claude --model MODEL \
   --baseline --split holdout --frozen-inputs /path/to/experiment/frozen-inputs.json
@@ -93,9 +96,16 @@ freeze formats fail before CLI startup, even if digest strings match. Preserve o
 records and run `--freeze-inputs` to a new path; this creates a new freeze event and
 does not retroactively strengthen an earlier experiment's evidence.
 
-Omit `--previous-skill` for new skills. `--baseline` includes no-target-skill;
-revisions automatically include it. `--case ID` narrows cases; `--trials N` repeats
-fresh matched trials. `--binary` selects an existing official CLI. The runner is a
+`--previous-skill` includes only candidate and previous. `--baseline` explicitly
+adds no-target-skill; combining both options requests three arms. Existing research
+commands that need three arms must specify both flags. With neither flag, only the
+candidate runs: useful for a smoke, not comparative evidence. `--case ID` narrows
+cases (repeat the flag for multiple cases); `--trials N` repeats fresh matched trials.
+The default is one trial per selected case/arm, in sequence; the runner does not
+automatically repeat, resume, or parallelize. Agent invocations equal cases × trials
+× requested arms; each invocation can contain multiple model/API calls. A revision
+with three cases changes from nine to six invocations, not a measured wall-time gain.
+`--binary` selects an existing official CLI. The runner is a
 behavior harness, not a native routing test. `--no-ledger` leaves the source ledger
 unchanged. `--self-test` runs infrastructure checks only, with no model calls.
 

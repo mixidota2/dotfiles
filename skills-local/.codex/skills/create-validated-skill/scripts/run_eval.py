@@ -494,8 +494,8 @@ def parse_args():
     parser.add_argument("--binary", help="existing official agent executable")
     parser.add_argument("--claude-accept-workspace-edits", action="store_true", help="explicitly approve Claude file edits in disposable trial workspaces; no shell tools")
     parser.add_argument("--model", help="pin model for matched comparisons")
-    parser.add_argument("--previous-skill", type=Path, help="frozen previous accepted skill for revision comparisons")
-    parser.add_argument("--baseline", action="store_true", help="include matched no-target-skill arm")
+    parser.add_argument("--previous-skill", type=Path, help="compare candidate with frozen previous version; does not add a no-skill arm")
+    parser.add_argument("--baseline", action="store_true", help="explicitly add a matched no-target-skill arm, including alongside --previous-skill")
     parser.add_argument("--split", choices=("development", "validation", "holdout"), default="development")
     parser.add_argument("--candidate-frozen", action="store_true", help="deprecated declaration; holdout still requires --frozen-inputs")
     parser.add_argument("--freeze-inputs", type=Path, help="write a new candidate/evaluation hash record outside the skill, then exit without agent calls")
@@ -552,7 +552,7 @@ def main():
         frozen = run_dir / "inputs/candidate"
         stage_tree(skill, frozen, skill=True)
         arms = {"candidate": frozen}
-        if args.baseline or args.previous_skill:
+        if args.baseline:
             arms = {"no_skill": None, **arms}
         if args.previous_skill:
             previous = run_dir / "inputs/previous"

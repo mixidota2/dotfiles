@@ -1,6 +1,6 @@
 ---
 name: create-validated-skill
-description: Create, revise, or evaluate reusable skills for Codex and Claude Code from user intent, specifications, domain knowledge, and/or execution evidence. Use for new skills, meaningful workflow or trigger changes, and adoption decisions. Excludes wording-only edits with unchanged behavior.
+description: Create, revise, or evaluate reusable skills for Codex and Claude Code from user intent, specifications, domain knowledge, and/or execution evidence. Use for new skills, revisions, and adoption decisions. Meaning-preserving edits need cheap checks; changes to instruction meaning need behavioral validation.
 ---
 
 # Create and evaluate skills
@@ -8,6 +8,10 @@ description: Create, revise, or evaluate reusable skills for Codex and Claude Co
 A skill should preserve the user's intent and help its consumer do the work.
 Writing plausible instructions is not evidence that using them helps. Creation,
 behavioral validation, and adoption are separate outcomes.
+
+For an edit that preserves intent, triggers, required/prohibited actions, and output,
+confirm that scope from the diff and go to the cheap checks in step 4. Reuse existing
+intent and evaluation definitions; do not restart research or a full experiment.
 
 ## 1. Capture intent and choose the mechanism
 
@@ -35,13 +39,15 @@ Before drafting, keep the original intent and previous accepted version availabl
 Derive a small set of must-pass checks from that intent, independently of the skill
 text, so dropping a requirement from the candidate cannot erase its check. Separate
 fidelity (including process and prohibitions) from output quality and efficiency.
-Start with a representative task, a requirement-sensitive boundary, and a changed
-input; include non-applicable requests to catch unnecessary procedures. Use actual
-fixtures and external checks for files/code and independent review for semantics.
+Select cases covering changed requirements and critical existing behavior. Include
+boundary, changed-input, and non-applicable cases where the change can affect them.
+Use actual fixtures and external checks for files/code; reserve independent review
+for semantics those checks cannot establish.
 
-Define an edit budget and acceptable costs for optional choices. Use development
-cases to improve the candidate, validation cases to select it, and separate unseen
-cases for the final consumer trial. See
+Define acceptable costs and stopping conditions from the task, without inventing
+universal trial/time limits. Use development cases for edits and validation when
+selecting among candidates. Keep final cases independent of edits; a single uniterated
+candidate does not require three separate suites. See
 [evaluation-method.md](references/evaluation-method.md) for evidence and decisions.
 
 ## 3. Write a grounded candidate
@@ -63,21 +69,33 @@ packages with `.candidate`; keep that marker until adoption. Test changed script
 
 ## 4. Validate the author and the consumer separately
 
-Run [validate_skill.py](scripts/validate_skill.py). Structural success is not
-behavioral evidence. Freeze the generated runtime package, then give it to a fresh
-consumer with an unseen task and the same capabilities/limits as the comparison
-arms. The author must not solve the measured task for the consumer. Test the actual
-result against the original requirements, not the author's self-report. When
-changing a skill creator, compare what each creator generates *and* what separate
-consumers accomplish using those generated skills.
+For every change, run [validate_skill.py](scripts/validate_skill.py) and relevant
+script checks. Meaning-preserving edits can stop there with the reason and limits
+recorded; wording that changes instructions is a behavior change. Static success
+is not behavioral evidence. For behavior changes, start with a limited smoke using
+a fresh consumer and the selected cases. Broaden validation for new capabilities,
+major revisions, high-risk operations, model/tool changes, or inconsistent smoke
+results. Do not rerun unaffected suites without a reason.
+
+Before adopting changed behavior, freeze the runtime package and check it on a case
+not used to guide the edit; an untouched smoke case can serve this scoped final
+check. Match capabilities/limits across arms. The author must not solve the measured
+task for the consumer. Grade actual results against the original requirements.
+When evaluating the creation method itself, compare what each creator generates
+and what fresh consumers do with those skills; this is not an extra stage for every
+ordinary skill edit.
 
 Read the [executor contract](references/executor-contract.md) and
 [evaluation schema](references/evaluation-schema.md) before using
 [run_eval.py](scripts/run_eval.py). An independently arranged fresh agent task is
-also valid; nested CLI execution is not required. Compare no-target-skill/candidate
-for new skills and include the previous accepted version for revisions. Test native
-routing separately: explicit loading is not discovery evidence. If execution is
-unavailable, finish the candidate and report the behavior trial as blocked/unrun.
+also valid; nested CLI execution is not required. Compare candidate/no-target-skill
+for new skills and candidate/previous for revisions. Add a third arm only when the
+claim needs it, such as testing continued benefit over no skill. Use independent
+parallel trials when the available runtime supports them; this runner is sequential.
+Test native routing when triggers, discovery, or a known routing interaction changes;
+explicit loading is not discovery evidence. If execution is unavailable, finish the
+candidate and report the behavior trial as blocked/unrun without repeated launches
+into a known blocker.
 
 ## 5. Decide without changing the goal
 
@@ -91,8 +109,13 @@ Open final cases only after selecting and freezing the candidate. The runner che
 an earlier input-hash record; this detects edits, not whether a case was unseen.
 A final case used to guide a fix becomes regression data and needs a replacement.
 Report case-level wins/losses/ties, requirement failures, costs, and uncertainty.
+Record coverage and reasons for omitted checks. A must-pass failure stops promotion;
+other authorized independent checks retain their own outcomes. Budget/time limits
+leave missing behavior evidence unjudged, never passed. Do not turn a small smoke
+into a general improvement claim.
 Retain/promote only with evidence for the stated purpose and no critical regression;
 otherwise reject, keep inconclusive, or report an infrastructure blocker. Keep
 candidates out of discovery/install paths until that decision. Preserve histories
 and existing accepted installations. Report structure, adapter tests, native routing,
-and real consumer validation separately for Codex and Claude; unrun is not passed.
+and real consumer validation separately for Codex and Claude; test engines in scope
+and report others unrun.
