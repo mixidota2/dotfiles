@@ -65,6 +65,16 @@ This repository starts from a reviewed file snapshot with a fresh Git history. P
 - `tk`: configuration only. The CLI is installed as a uv tool and its task database remains local.
 - `skills-local`: locally maintained skills. The external tk skill is restored by `skills/install.sh`.
 
+Create new skill candidates outside agent discovery roots, for example with
+`init_skill.py NAME --path ./skill-candidates`. The initializer adds a `.candidate`
+marker; the installer skips marked packages for Codex and Claude while preserving
+existing installations and the six unmarked skills. For revisions, use a separate
+copy/checkout rather than editing through an installed symlink. After an evidence-
+backed adoption decision, remove the marker and place the reviewed package in
+`skills-local/.codex/skills`; installation remains a separate action. A marker does
+not prevent native discovery or revoke an existing link. See the
+[candidate workflow](skills-local/.codex/skills/create-validated-skill/references/evaluation-method.md#candidate-experiment-decision).
+
 The Brewfile installs the managed CLI tools and terminal applications, including Neovim and the command-line dependencies used by LazyVim and Octo.
 
 ## Checks

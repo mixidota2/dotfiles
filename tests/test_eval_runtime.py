@@ -191,4 +191,117 @@ class RuntimeTests(unittest.TestCase):
         trials=[{'config':arm,'task':'t','trial':1,'verdict':verdict,'executor_duration_ms':1} for arm,verdict in [('candidate','pass'),('no_skill','error')]]
         self.assertEqual(r.summarize(trials)[1][0]['result'],'inconclusive')
 
+    def test_failure_patterns_accept_current_and_legacy_candidate_labels_only(self):
+        trials = []
+        for arm in ('candidate', 'with_skill', 'previous', 'no_skill'):
+            trials.append({'config': arm, 'task': arm, 'trial': 1, 'requirements': [
+                {'id': 'legacy', 'semantic': {'verdict': 'fail', 'general_fix_rule': 'Check the stated unit.'}},
+                {'id': 'current', 'combined_verdict': 'fail', 'general_fix_rule': 'Respect required ordering.'},
+                {'id': 'observation', 'combined_verdict': 'fail', 'objective': [{'verdict': 'fail'}]},
+            ]})
+        ledger = {'failure_patterns': []}
+        r.update_failure_patterns(ledger, {'id': 'run', 'behavior_trials': trials})
+        self.assertEqual(len(ledger['failure_patterns']), 2)
+        for pattern in ledger['failure_patterns']:
+            self.assertEqual([x['task'] for x in pattern['seen_in']], ['candidate', 'with_skill'])
+
+
+class FrozenInputTests(unittest.TestCase):
+    """Exercise the full runner with fake transport; never start an agent CLI."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.skill = self.root / 'sample'
+        self.skill.mkdir()
+        (self.skill / 'SKILL.md').write_text('---\nname: sample\ndescription: Test input freezing.\n---\nUse the input.')
+        r.write_yaml(self.skill / 'evals/eval.yaml', {
+            'name': 'sample', 'version': 3, 'holdout': ['tasks/final.yaml']})
+        r.write_yaml(self.skill / 'evals/tasks/final.yaml', {
+            'id': 'final', 'kind': 'holdout', 'scenario': 'Return actual.', 'fixture': 'fixtures/input',
+            'requirements': [{'id': 'exact', 'critical': True, 'description': 'Exact answer',
+                              'objective': [{'kind': 'contains', 'value': 'actual'}]}]})
+        fixture = self.skill / 'evals/fixtures/input'
+        fixture.mkdir(parents=True)
+        (fixture / 'input.txt').write_text('input')
+        self.lock = self.root / 'frozen.json'
+
+    def run_main(self, *args, execute=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(r.sys, 'argv', [str(SCRIPTS / 'run_eval.py'), str(self.skill), *args]), \
+             mock.patch.object(a, 'inspect_cli', return_value='fake-cli') as inspect, \
+             mock.patch.object(a, 'execute', side_effect=execute or AssertionError('must not execute')) as call, \
+             contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = r.main()
+        return code, stdout.getvalue(), stderr.getvalue(), inspect.call_count, call.call_count
+
+    @staticmethod
+    def execute(**kw):
+        kw['output'].write_text(json.dumps({'deliverable': 'actual'}))
+        kw['trace'].write_text(json.dumps({'type': 'turn.completed'}))
+        return {'exit_code': 0, 'duration_ms': 1, 'tool_uses': 0, 'usage': {}}
+
+    def freeze(self):
+        result = self.run_main('--freeze-inputs', str(self.lock))
+        self.assertEqual((result[0], result[3], result[4]), (0, 0, 0), result)
+        return self.lock.read_bytes()
+
+    def test_declaration_alone_cannot_run_holdout(self):
+        for args in ([], ['--candidate-frozen']):
+            result = self.run_main('--split', 'holdout', *args)
+            self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+            self.assertIn('--frozen-inputs', result[2])
+
+    def test_record_never_overwrites_and_matching_inputs_remain_inconclusive(self):
+        before = self.freeze()
+        result = self.run_main('--freeze-inputs', str(self.lock))
+        self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+        self.assertEqual(self.lock.read_bytes(), before)
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock),
+                               '--baseline', '--model', 'fake', execute=self.execute)
+        self.assertEqual((result[0], result[3], result[4]), (3, 1, 2), result)
+        summary = r.load_yaml(Path(json.loads(result[1])['results_dir']) / 'summary.yaml')
+        self.assertEqual(summary['input_freeze'], json.loads(before))
+        self.assertEqual(summary['decision'], 'inconclusive')
+        # Appending evidence/ledger must not invalidate the source input record.
+        again = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=self.execute)
+        self.assertEqual(again[0], 3, again)
+
+    def test_changed_runtime_case_fixture_or_grader_blocks_before_cli(self):
+        grader = self.skill / 'evals/graders/check.py'
+        grader.parent.mkdir()
+        grader.write_text('print("original")')
+        self.freeze()
+        for relative in ('SKILL.md', 'evals/eval.yaml', 'evals/tasks/final.yaml',
+                         'evals/fixtures/input/input.txt', 'evals/graders/check.py'):
+            with self.subTest(relative=relative):
+                path = self.skill / relative
+                original = path.read_text()
+                path.write_text(original + '\n# changed\n')
+                result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock))
+                self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+                self.assertIn('frozen input mismatch', result[2])
+                path.write_text(original)
+
+    def test_malformed_or_missing_record_and_in_package_record_fail_closed(self):
+        for contents in (None, '{', '[]', '{"version": 1}'):
+            if contents is not None:
+                self.lock.write_text(contents)
+            result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock))
+            self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+        result = self.run_main('--freeze-inputs', str(self.skill / 'lock.json'))
+        self.assertEqual(result[0], 2, result)
+        self.assertFalse((self.skill / 'lock.json').exists())
+
+    def test_mutated_evaluation_snapshot_is_blocked(self):
+        self.freeze()
+        def mutate(**kw):
+            result = self.execute(**kw)
+            run_dir = kw['workspace'].parents[4]
+            (run_dir / 'evaluation-inputs/fixtures/input/input.txt').write_text('contaminated')
+            return result
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=mutate)
+        self.assertEqual(result[0], 2, result)
+        self.assertIn('contaminated run', result[2])
+
 if __name__=='__main__': unittest.main()

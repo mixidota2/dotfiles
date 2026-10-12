@@ -393,7 +393,7 @@ class SkillInitializerTests(unittest.TestCase):
         result = self.initialize()
         self.assertEqual(result.returncode, 0, result.stderr)
         skill = self.root / "new-skill"
-        self.assertEqual([path.name for path in skill.iterdir()], ["SKILL.md"])
+        self.assertCountEqual([path.name for path in skill.iterdir()], ["SKILL.md", ".candidate"])
         self.assertNotIn("evals/eval.yaml", (skill / "SKILL.md").read_text())
         self.assertTrue(validator.validate(skill))  # Unfinished instructions are not a completed skill.
 
@@ -406,6 +406,27 @@ class SkillInitializerTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "new-skill")
         self.assertTrue((skill / "evals/ledger.yaml").is_file())
         self.assertIn("evals/eval.yaml", (skill / "SKILL.md").read_text())
+
+    def test_candidates_refuse_discovery_roots_including_symlink_aliases(self):
+        for root in (".codex/skills", ".claude/skills", ".agents/skills", ".pi/agent/skills"):
+            destination = self.root / root
+            result = self.initialize("new-skill", "--path", str(destination))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertFalse(destination.exists())
+        destination = self.root / ".agents/skills"
+        destination.mkdir(parents=True)
+        alias = self.root / "alias"
+        alias.symlink_to(destination, target_is_directory=True)
+        result = self.initialize("new-skill", "--path", str(alias))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(list(destination.iterdir()), [])
+        shared = self.root / "shared"
+        shared.mkdir()
+        destination.rmdir()
+        destination.symlink_to(shared, target_is_directory=True)
+        result = self.initialize("new-skill", "--path", str(destination))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(list(shared.iterdir()), [])
 
     def test_broken_existing_symlink_is_not_overwritten(self):
         target = self.root / "new-skill"

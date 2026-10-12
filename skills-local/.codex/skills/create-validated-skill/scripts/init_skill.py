@@ -18,7 +18,7 @@ TEMPLATE = ROOT / "assets" / "evals-template"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("name", help="lowercase kebab-case skill name")
-    parser.add_argument("--path", required=True, type=Path, help="parent skills directory")
+    parser.add_argument("--path", required=True, type=Path, help="candidate parent outside agent discovery roots (e.g. ./skill-candidates)")
     parser.add_argument("--evals", action="store_true", help="include the optional version-3 evaluation scaffold")
     return parser.parse_args()
 
@@ -33,11 +33,16 @@ description: TODO Describe what this skill does and the concrete requests that t
 
 # {title}
 
-TODO State the outcome this skill enables.
+TODO State the requested outcome, when this applies, and when it does not.
+
+## Intent and boundaries
+
+TODO Preserve the user's required and forbidden behavior, output, and evidence.
+TODO Distinguish those requirements from implementation choices that may change.
 
 ## Workflow
 
-1. TODO Define the first observable action.
+1. TODO Define a concrete action, its reason, and the condition where it is needed.
 2. TODO Define validation and completion.
 
 {resources}"""
@@ -50,6 +55,14 @@ def main() -> int:
         return 2
 
     target = args.path.expanduser().resolve() / args.name
+    # Candidates must not be discovered before adoption, even in a repository.
+    discovery_roots = {(".codex", "skills"), (".claude", "skills"),
+                       (".agents", "skills"), (".pi", "agent", "skills")}
+    paths = (args.path.expanduser().absolute() / args.name, target)
+    if any(tuple(path.parts[i:i + len(root)]) == root
+           for path in paths for root in discovery_roots for i in range(len(path.parts))):
+        print("error: create candidates outside agent discovery roots; use --path ./skill-candidates", file=sys.stderr)
+        return 2
     if target.exists() or target.is_symlink():
         print(f"error: target already exists: {target}", file=sys.stderr)
         return 2
@@ -59,6 +72,7 @@ def main() -> int:
         return 2
 
     target.mkdir(parents=True)
+    (target / ".candidate").touch()
     (target / "SKILL.md").write_text(skill_markdown(args.name, args.evals), encoding="utf-8")
     if args.evals:
         shutil.copytree(TEMPLATE, target / "evals")
@@ -66,6 +80,7 @@ def main() -> int:
             text = path.read_text(encoding="utf-8").replace("TODO-skill-name", args.name)
             path.write_text(text, encoding="utf-8")
     print(f"initialized {target}")
+    print("candidate only: keep outside discovery roots; the dotfiles installer skips .candidate packages")
     print("next: replace scaffold placeholders and choose validation proportional to the change")
     if args.evals:
         print("evaluation scaffold: version 3; replace its placeholders before running evaluations")

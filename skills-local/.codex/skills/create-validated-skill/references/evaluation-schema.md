@@ -60,9 +60,20 @@ selection, invalid output, missing completed trace, and executor errors fail clo
 python3 scripts/validate_skill.py /path/to/skill
 python3 scripts/run_eval.py /path/to/candidate --engine codex --model MODEL \
   --baseline --previous-skill /path/to/previous --split validation
+python3 scripts/run_eval.py /path/to/candidate --freeze-inputs /path/to/experiment/frozen-inputs.json
 python3 scripts/run_eval.py /path/to/candidate --engine claude --model MODEL \
-  --baseline --split holdout --candidate-frozen
+  --baseline --split holdout --frozen-inputs /path/to/experiment/frozen-inputs.json
 ```
+
+`--freeze-inputs` creates an exclusive (never overwritten) hash record outside the
+skill package and exits without calling a CLI. It hashes runtime files and eval
+inputs (manifest, cases, fixtures, graders), excluding results, ledger, and evidence.
+Have the independent coordinator keep/commit this record before final evaluation.
+`--frozen-inputs` compares the staged inputs before CLI startup; any mismatch blocks
+the run. The legacy `--candidate-frozen` declaration alone no longer permits holdout.
+Input snapshots are also checked after execution. These checks detect input changes,
+not whether the author previously saw a case or regenerated the record. They do not
+replace separation of author and consumer or an independently retained holdout.
 
 Omit `--previous-skill` for new skills. `--baseline` includes no-target-skill;
 revisions automatically include it. `--case ID` narrows cases; `--trials N` repeats
@@ -73,6 +84,7 @@ unchanged. `--self-test` runs infrastructure checks only, with no model calls.
 Exit codes: 1 candidate objective failure; 2 infrastructure/configuration error;
 3 completed but inconclusive experiment. There is intentionally no automatic
 adoption exit code. `--self-test` returns 0 when its infrastructure checks pass.
+`--freeze-inputs` returns 0 when the record is written, not when behavior is validated.
 
 ## Evidence
 
@@ -82,6 +94,12 @@ stderr, external grader output, result YAML, and a summary are retained. Summari
 record agent/CLI/model, split, content hashes, matched case comparisons, duration,
 usage, limitations, and the decision. Default model selection remains explicitly
 unresolved. A hash is reproducibility evidence, not isolation or behavioral proof.
+When supplied, `input_freeze` preserves the prior record in the summary and ledger.
+Its evaluation hash covers source inputs; `evaluation_sha256` additionally covers
+the runner's derived manifest and selected-task snapshots. Legacy `with_skill` and
+current `candidate` failure annotations both feed failure-pattern history; objective
+failures remain observations until a concrete remedy is supplied, never fabricated
+general rules.
 
 ## Ledger paths
 

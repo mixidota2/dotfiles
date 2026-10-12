@@ -128,6 +128,36 @@ class InstallerPortabilityTests(unittest.TestCase):
         self.assertEqual(list(self.home.iterdir()), [])
         self.assertFalse(self.backups.exists())
 
+    def test_candidate_is_skipped_without_replacing_accepted_installation(self):
+        candidate = "skills-local/.codex/skills/proposed"
+        for name in ("SKILL.md", ".candidate", "scripts/helper.py"):
+            self.write_source(f"{candidate}/{name}")
+        self.write_source("skill-candidates/outside/SKILL.md")
+        existing = [self.home / ".codex/skills/proposed/SKILL.md",
+                    self.home / ".claude/skills/proposed/SKILL.md"]
+        for path in existing:
+            path.parent.mkdir(parents=True)
+            path.write_text("accepted version\n")
+        for args in (("--dry-run",), ()):
+            result = self.install(*args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("skip candidate", result.stdout)
+            self.assertNotIn("outside", result.stdout)
+            self.assertNotIn("backup  ", result.stdout)
+            for path in existing:
+                self.assertEqual(path.read_text(), "accepted version\n")
+                self.assertFalse(path.is_symlink())
+                self.assertFalse((path.parent / "scripts").exists())
+        self.assertTrue((self.home / ".codex/skills/new-skill/SKILL.md").is_symlink())
+        self.assertTrue((self.home / ".claude/skills/new-skill").is_symlink())
+        # Removing the marker is an explicit adoption action; normal linking resumes.
+        (self.repo / candidate / ".candidate").unlink()
+        self.assertEqual(self.install().returncode, 0)
+        for path in existing:
+            self.assertEqual(path.read_text(), "fixture\n")
+        self.assertEqual((self.backups / ".codex/skills/proposed/SKILL.md").read_text(), "accepted version\n")
+        self.assertEqual((self.backups / ".claude/skills/proposed/SKILL.md").read_text(), "accepted version\n")
+
     def test_dry_run_never_executes_existing_tools(self):
         for tool in ("brew", "uv", "tk"):
             self.write_tool(tool, "exit 99\n")
