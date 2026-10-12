@@ -6,7 +6,6 @@ requirements:
   - id: TODO-requirement-id
     critical: true
     description: TODO State the expected rejection, redirection, or non-activation.
-    text:
-      regex_any: ['TODO broad surface regex']
-    semantic:
-      rubric: TODO Add a semantic judgment rule.
+    objective:
+      - kind: contains
+        value: TODO Replace with a literal outcome check or an external artifact verifier.

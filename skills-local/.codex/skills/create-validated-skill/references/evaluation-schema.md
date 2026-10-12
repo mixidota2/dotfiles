@@ -1,128 +1,94 @@
-# Evaluation schema
+# Evaluation schema and CLI
+
+Python 3 plus PyYAML are required. V2 historical manifests/ledgers remain intact;
+new objective checks use version 3. Existing qualitative rubrics are not silently
+regraded or treated as objective passes.
 
 ## Manifest
 
-Use `evals/eval.yaml` to declare behavior tasks, representative baseline cases,
-routing smoke tests, trial counts, thresholds, and convergence gates.
-
 ```yaml
 name: example-skill
-version: 2
-tier: standard
-trials_per_task: 1
-tasks:
-  - tasks/typical.yaml
-routing:
-  profiles: [isolated]
-  trials_per_case: 1
-  cases:
-    - routing/positive.yaml
-    - routing/negative.yaml
-    - routing/near-miss.yaml
-  thresholds:
-    positive_activation_rate: 0.9
-    negative_false_activation_rate: 0.05
-    near_miss_false_activation_rate: 0.1
+version: 3
+tasks: [tasks/development.yaml]
+validation: [tasks/validation.yaml]
+holdout: [tasks/final.yaml]
 ```
 
-## Behavioral task
-
-Pair a broad surface grader and a semantic rubric on every requirement.
+Task files require unique safe `id`, nonempty `scenario`, and nonempty
+`requirements` with unique IDs and at least one `critical: true`. Optional `fixture`
+is a directory relative to evals/. `workspace_write: true` requests writable Codex
+work; default is read-only. Claude writable trials report capability blocked by default. Explicit
+`--claude-accept-workspace-edits` approves per-run file edits in each disposable
+workspace using `acceptEdits`; only Read/Glob/Grep/Write/Edit are exposed. No shell,
+network, additional directories, or persistent permission change is included.
+An external trusted grader may run file tests. This transport is not claimed
+runtime-validated without a real Claude run. Do not substitute a narrative task for a promised
+working file. Example task:
 
 ```yaml
-id: typical
+id: transform-input
 kind: typical
-scenario: |
-  A realistic user request.
+fixture: fixtures/input-a
+workspace_write: true
+scenario: Convert input.csv into output.json using the specified schema.
 requirements:
-  - id: inspect-existing
+  - id: exact-output
     critical: true
-    description: Searches for an existing implementation before creating one.
-    text:
-      required: false
-      regex_any:
-        - '(?i)(existing|overlap|duplicate|already installed)'
-    semantic:
-      rubric: The deliverable explicitly checks for an existing implementation.
+    description: Output has the independently calculated values.
+    objective:
+      - kind: command
+        argv: [python3, '{eval_root}/graders/check_output.py', '{workspace}']
+        timeout_seconds: 30
 ```
 
-Use stable requirement ids so ledger history survives wording improvements.
-Set `text.required: true` only for a literal token, command, or artifact shape
-whose exact presence is part of the contract. Otherwise a semantic pass survives
-a surface-text miss while the disagreement is recorded.
+Objective check kinds:
+- `contains` / `regex`: `value` tested only against final deliverable text.
+- `json_equals`: parse deliverable JSON, select optional RFC6901 `pointer`, compare `value`.
+- `file_exists`: `path` is a contained workspace-relative file.
+- `file_contains`: `path` plus literal `value`.
+- `command`: argv list, no shell; exit zero passes. `{workspace}` and `{eval_root}`
+  are substituted. Store fixed grader code under evals/, outside the fixture.
 
-## Baseline comparison
+Objective checks should be exercised with both valid and deliberately wrong
+artifacts. A text match checks a literal, not broad semantic correctness. Missing
+objective checks produce `review_required`, never an automatic pass. Empty case
+selection, invalid output, missing completed trace, and executor errors fail closed.
 
-Run a representative task with `--baseline`. The runner stores separate
-`with_skill` and `without_skill` outputs and reports deltas for task pass rate,
-requirement pass rate, duration, and tool use. Apply the same hidden requirements
-to both configurations; do not tell either executor the expected answer.
+## Commands
 
-## Routing group
-
-Do not mention the target skill in prompts.
-
-```yaml
-kind: positive
-expected_activation: true
-cases:
-  - id: create-domain-skill
-    critical: true
-    prompt: Create a reusable Codex workflow for warehouse incident diagnosis.
+```sh
+python3 scripts/validate_skill.py /path/to/skill
+python3 scripts/run_eval.py /path/to/candidate --engine codex --model MODEL \
+  --baseline --previous-skill /path/to/previous --split validation
+python3 scripts/run_eval.py /path/to/candidate --engine claude --model MODEL \
+  --baseline --split holdout --candidate-frozen
 ```
 
-Keep positive, negative, and near-miss groups separate. Negative cases are
-unrelated requests with overlapping vocabulary. Near misses are adjacent tasks
-that should use `AGENTS.md`, a deterministic tool, documentation, or another
-skill.
+Omit `--previous-skill` for new skills. `--baseline` includes no-target-skill;
+revisions automatically include it. `--case ID` narrows cases; `--trials N` repeats
+fresh matched trials. `--binary` selects an existing official CLI. The runner is a
+behavior harness, not a native routing test. `--no-ledger` leaves the source ledger
+unchanged. `--self-test` runs infrastructure checks only, with no model calls.
 
-## Run artifacts
+Exit codes: 1 candidate objective failure; 2 infrastructure/configuration error;
+3 completed but inconclusive experiment. There is intentionally no automatic
+adoption exit code. `--self-test` returns 0 when its infrastructure checks pass.
 
-`scripts/run_eval.py` writes one directory per run and one directory per trial:
+## Evidence
 
-```text
-evals/results/<run-id>/
-  summary.yaml
-  routing/<profile>/<case>/trial-N/
-  behavior/<task>/<with_skill|without_skill>/trial-N/
-    executor-output.json
-    executor-events.jsonl
-    semantic-grade.json
-    semantic-events.jsonl
-    result.yaml
-```
+Each run has a timestamp plus random unique ID and is created exclusively, so
+same-second runs cannot overwrite each other. Inputs, per-arm output, raw events,
+stderr, external grader output, result YAML, and a summary are retained. Summaries
+record agent/CLI/model, split, content hashes, matched case comparisons, duration,
+usage, limitations, and the decision. Default model selection remains explicitly
+unresolved. A hash is reproducibility evidence, not isolation or behavioral proof.
 
-A compact summary is appended to `evals/ledger.yaml`. Keep raw artifacts locally
-unless they are reviewed and intentionally selected as durable fixtures.
+## Ledger paths
 
-### Ledger paths
-
-New automated ledger records use this path contract:
-
-- `results_dir_scope: skill`: `results_dir` is a POSIX path relative to the skill
-  directory, normally `evals/results/<run-id>`.
-- `results_dir_scope: external`: `results_dir` is `null`. The selected result
-  directory is outside the skill, so its location is deliberately not retained
-  in the ledger. Use the local CLI output or `summary.yaml` to locate this run;
-  the ledger alone cannot resolve it on another computer.
-- Behavioral `output_path` and `events_path` are POSIX paths relative to that
-  run's result directory, including when the result directory is external.
-  A reference outside the run directory is `null`, with its field name listed
-  in that trial's `unresolved_artifacts`. Such references are not copied,
-  silently converted to absolute paths, or recoverable from the ledger.
-
-Default results go under the skill's `evals/results`. `--results-dir` selects a
-custom parent directory; relative values are based on the invocation's current
-working directory, absolute values are used directly, and `~` is expanded.
-Containment is checked after resolving `..` and symlinks. Missing artifacts can
-still have relative references; a reference is not proof that a file exists.
-
-Existing ledger entries are not migrated or reinterpreted when a run is appended.
-Older entries may lack the scope/unresolved fields and retain their historical
-path formats. Treat those as legacy records rather than assuming the new contract.
-
-Only these structured ledger path fields are normalized. Local `summary.yaml`,
-per-trial `result.yaml`, executor outputs, and traces retain their original data.
-Free-text evidence, issue descriptions, fix rules, and other user/model-provided
-content are not redacted. Review them separately before committing or sharing;
-portable paths do not guarantee anonymous or shareable content.
+New ledger records are schema-marked. Result directories are skill-relative when
+contained in the skill, otherwise `results_dir: null` with `results_dir_scope:
+external`. Artifact paths are run-relative; out-of-scope artifacts are null and
+listed as unresolved. Historical records are preserved verbatim as data. Raw
+artifacts may contain local paths or sensitive user data; normalization is not
+anonymization. Review artifacts before committing/sharing them. Never delete
+historical failed experiments to make a candidate look better.

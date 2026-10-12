@@ -26,6 +26,8 @@ Install Homebrew dependencies and user-level CLI tools on a fresh machine with:
 
 Homebrew must already be installed. Add `--dry-run` to preview tool commands; `uv` can be absent during the preview because the Brewfile provides it.
 
+Herdr is included in `./install.sh --tools` through the [Homebrew `herdr` formula](https://formulae.brew.sh/formula/herdr), following its [official installation instructions](https://herdr.dev/docs/install/). Launch it from a terminal with `herdr`; update this installation with `brew upgrade herdr`. `./install.sh` without `--tools` only links configuration and skills. Existing Herdr keybindings are unchanged, and sessions, logs, and sockets stay local. If Herdr was installed another way, check `type -a herdr` before choosing which installation to keep.
+
 Claude Code is included in the macOS Homebrew installation. See [Claude Code setup](docs/claude-code.md) for skill sharing, updates, and verification.
 
 Restore the external [tk skill](https://github.com/mixidota2/tasukura-skills) for Codex and Claude Code separately (`./install.sh --tools` provides Node.js/npm and `npx` through Homebrew):
@@ -80,3 +82,16 @@ python3 skills-local/.codex/skills/create-validated-skill/scripts/run_eval.py --
 ```
 
 The portable-checks workflow runs the tests, evaluator self-test, and `/bin/sh -n` checks on Ubuntu 24.04 and macOS 15 with Python 3.12 and PyYAML. It does not install dotfiles into the runner's home or run real Homebrew, `uv`, `tk`, or `npx` commands.
+
+## Skill evaluation
+
+The shared creation skill supports Codex and Claude Code CLI adapters. Package
+compatibility, stubbed adapter tests, and real behavioral validation are separate
+claims. Use matched no-skill/previous/candidate fixtures and independent outcome
+checks; the runner never installs a candidate or configures authentication.
+Legacy semantic-only suites and historical ledgers are preserved, not silently
+regraded. See [the evaluation method](skills-local/.codex/skills/create-validated-skill/references/evaluation-method.md)
+and [CLI/schema](skills-local/.codex/skills/create-validated-skill/references/evaluation-schema.md).
+Infrastructure failure is blocked; missing evidence or unverified global skill
+isolation is inconclusive. Passing unit tests does not prove skills improve either
+agent.

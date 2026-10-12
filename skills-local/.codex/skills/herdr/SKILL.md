@@ -45,7 +45,8 @@ herdr session attach <name>    # attach named session
 herdr server stop              # stop server and panes
 herdr server reload-config     # apply config changes
 herdr --default-config         # print full default config
-herdr update                   # update Herdr
+brew upgrade herdr             # update this repository's Homebrew installation
+herdr update                   # only for Herdr's own installer
 herdr --remote <ssh-target>    # attach to remote Herdr server through SSH
 ```
 

@@ -1,0 +1,11 @@
+id: holdout
+kind: holdout
+scenario: |
+  TODO Write a final task-family variant opened only after freezing the candidate.
+requirements:
+  - id: TODO-requirement-id
+    critical: true
+    description: TODO Define an independent observable outcome.
+    objective:
+      - kind: contains
+        value: TODO Replace with an exact outcome check or external artifact verifier.

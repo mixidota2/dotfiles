@@ -1,38 +1,36 @@
 #!/usr/bin/env python3
-"""Run reproducible Codex routing and behavioral evaluations for a skill."""
-
+"""Run matched skill experiments; report evidence, never automatically adopt a skill."""
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
-import contextlib
 import datetime as dt
+import hashlib
 import json
-import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
-import time
-from pathlib import Path
-from typing import Any, Iterator
+import uuid
+from typing import Any
 
+# Also works when imported by unittest from outside the script directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_adapters
+import validate_skill
 try:
     import yaml
-except ImportError:  # pragma: no cover - exercised by CLI error handling
+except ImportError:
     yaml = None
-
 
 ROOT = Path(__file__).resolve().parent.parent
 EXECUTOR_SCHEMA = ROOT / "assets" / "executor-output.schema.json"
 GRADER_SCHEMA = ROOT / "assets" / "semantic-grade.schema.json"
 
-
 def load_yaml(path: Path) -> dict[str, Any]:
     if yaml is None:
         raise RuntimeError("PyYAML is required; run with: uv run --with pyyaml python scripts/run_eval.py ...")
-    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    value = validate_skill.parse_yaml_mapping(path.read_text(encoding="utf-8"), str(path))
     if not isinstance(value, dict):
         raise ValueError(f"expected a YAML mapping: {path}")
     return value
@@ -47,525 +45,6 @@ def write_yaml(path: Path, value: Any) -> None:
 
 def utc_stamp() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-@contextlib.contextmanager
-def isolated_codex_home(
-    source_home: Path, skill_dir: Path | None
-) -> Iterator[Path]:
-    with tempfile.TemporaryDirectory(prefix="validated-skill-codex-home.") as raw:
-        home = Path(raw)
-        auth = source_home / "auth.json"
-        if not auth.is_file():
-            raise RuntimeError(f"Codex auth file not found: {auth}")
-        (home / "auth.json").symlink_to(auth)
-        if skill_dir is not None:
-            skills = home / "skills"
-            skills.mkdir()
-            (skills / skill_dir.name).symlink_to(skill_dir.resolve())
-        yield home
-
-
-def run_codex(
-    *,
-    prompt: str,
-    output_schema: Path,
-    output_path: Path,
-    events_path: Path,
-    stderr_path: Path,
-    codex_bin: str,
-    source_home: Path,
-    skill_dir: Path | None,
-    profile: str,
-    model: str | None,
-    timeout_seconds: int,
-) -> int:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    workdir = output_path.parent / "workspace"
-    workdir.mkdir(exist_ok=True)
-    cmd = [
-        codex_bin,
-        "exec",
-        "--ephemeral",
-        "--json",
-        "--color",
-        "never",
-        "--skip-git-repo-check",
-        "--sandbox",
-        "read-only",
-        "--output-schema",
-        str(output_schema),
-        "--output-last-message",
-        str(output_path),
-        "--cd",
-        str(workdir),
-    ]
-    if model:
-        cmd.extend(["--model", model])
-
-    env = os.environ.copy()
-    with contextlib.ExitStack() as stack:
-        if profile == "isolated":
-            home = stack.enter_context(isolated_codex_home(source_home, skill_dir))
-            env["CODEX_HOME"] = str(home)
-            cmd.append("--ignore-user-config")
-        elif profile != "normal":
-            raise ValueError(f"unknown profile: {profile}")
-        cmd.append(prompt)
-        with events_path.open("w", encoding="utf-8") as events:
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    stdout=events,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=env,
-                    timeout=timeout_seconds,
-                )
-            except subprocess.TimeoutExpired as exc:
-                stderr_path.write_text(
-                    f"executor timed out after {timeout_seconds}s\n{exc.stderr or ''}",
-                    encoding="utf-8",
-                )
-                return 124
-        stderr_path.write_text(proc.stderr, encoding="utf-8")
-        return proc.returncode
-
-
-def read_json(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError(f"expected JSON object: {path}")
-    return value
-
-
-def event_strings(path: Path) -> list[str]:
-    values: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        values.append(json.dumps(event, ensure_ascii=False))
-    return values
-
-
-def event_metrics(path: Path) -> dict[str, Any]:
-    tool_uses = 0
-    usage: dict[str, Any] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        item = event.get("item", {})
-        if event.get("type") == "item.completed" and item.get("type") in {
-            "command_execution",
-            "mcp_tool_call",
-            "web_search",
-        }:
-            tool_uses += 1
-        if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
-            usage = event["usage"]
-    return {"tool_uses": tool_uses, "usage": usage}
-
-
-def detect_activation(events_path: Path, skill_name: str) -> tuple[bool, list[str]]:
-    needle = f"skills/{skill_name}/SKILL.md"
-    evidence: list[str] = []
-    for event in event_strings(events_path):
-        lowered = event.lower()
-        toolish = any(token in lowered for token in ("tool", "command_execution", "exec_command"))
-        if toolish and needle in event.replace("\\\\", "/"):
-            evidence.append(event[:1000])
-    return bool(evidence), evidence
-
-
-def text_grade(output: dict[str, Any], requirement: dict[str, Any]) -> dict[str, Any]:
-    corpus = json.dumps(output, ensure_ascii=False)
-    config = requirement.get("text", {})
-    patterns = config.get("regex_any", [])
-    matches = [pattern for pattern in patterns if re.search(pattern, corpus)]
-    return {
-        "verdict": "pass" if matches else "fail",
-        "matched_patterns": matches,
-        "patterns": patterns,
-    }
-
-
-def executor_contract_prompt(user_prompt: str, skill_dir: Path | None) -> str:
-    skill_clause = (
-        f"Use the skill at {skill_dir.resolve()} when applicable. " if skill_dir is not None else ""
-    )
-    return f"""Act as a fresh executor for this user request.
-
-User request:
-{user_prompt}
-
-{skill_clause}Do not inspect evaluation definitions, expected answers, or ledger files
-under the target skill's evals/ directory. The assigned runner workspace and output
-paths are allowed even if their parent path contains evals/results. Complete the
-request as far as the read-only environment permits; otherwise follow any explicit
-narrative-evaluation instruction in the scenario and mark genuinely blocked work
-honestly.
-
-In the structured final response, return the deliverable plus a phase trace for
-Understanding, Planning, Execution, and Formatting. For every unclear point use
-Issue / Cause / General Fix Rule. List discretionary fill-ins, retries, and
-uncompleted work. Do not grade yourself against any hidden checklist.
-"""
-
-
-def semantic_grade(
-    *,
-    task: dict[str, Any],
-    executor_output: dict[str, Any],
-    trial_dir: Path,
-    args: argparse.Namespace,
-) -> tuple[dict[str, Any], int]:
-    requirements = [
-        {
-            "id": req["id"],
-            "critical": bool(req.get("critical")),
-            "description": req["description"],
-            "rubric": req["semantic"]["rubric"],
-        }
-        for req in task["requirements"]
-    ]
-    prompt = f"""Act only as an evaluator. Do not use or inspect the target skill.
-
-Scenario:
-{task['scenario']}
-
-Hidden requirements:
-{json.dumps(requirements, ensure_ascii=False, indent=2)}
-
-Executor output:
-{json.dumps(executor_output, ensure_ascii=False, indent=2)}
-
-Judge each requirement as pass, fail, or unclear using observable evidence. Do not
-accept the executor's self-reported success without confirming it in the
-deliverable. For every fail or unclear verdict, return Issue / Cause / General Fix
-Rule. Return one result for every requirement id.
-"""
-    output = trial_dir / "semantic-grade.json"
-    events = trial_dir / "semantic-events.jsonl"
-    stderr = trial_dir / "semantic-stderr.txt"
-    code = run_codex(
-        prompt=prompt,
-        output_schema=GRADER_SCHEMA,
-        output_path=output,
-        events_path=events,
-        stderr_path=stderr,
-        codex_bin=args.codex_bin,
-        source_home=args.source_codex_home,
-        skill_dir=None,
-        profile="isolated",
-        model=args.model,
-        timeout_seconds=args.timeout_seconds,
-    )
-    return (read_json(output) if output.is_file() else {"requirements": []}), code
-
-
-def merge_requirement_grades(
-    task: dict[str, Any], output: dict[str, Any], semantic: dict[str, Any]
-) -> list[dict[str, Any]]:
-    semantic_by_id = {item.get("id"): item for item in semantic.get("requirements", [])}
-    results: list[dict[str, Any]] = []
-    for requirement in task["requirements"]:
-        req_id = requirement["id"]
-        text = text_grade(output, requirement)
-        sem = semantic_by_id.get(req_id, {"verdict": "unclear", "evidence": "missing semantic grade"})
-        sem_verdict = sem.get("verdict", "unclear")
-        text_required = bool(requirement.get("text", {}).get("required", False))
-        surface_disagreement = sem_verdict == "pass" and text["verdict"] != "pass"
-        if sem_verdict == "fail":
-            combined = "fail"
-        elif sem_verdict == "pass":
-            combined = "unclear" if text_required and surface_disagreement else "pass"
-        else:
-            combined = "unclear"
-        results.append(
-            {
-                "id": req_id,
-                "critical": bool(requirement.get("critical")),
-                "description": requirement["description"],
-                "text": text,
-                "semantic": sem,
-                "surface_disagreement": surface_disagreement,
-                "combined_verdict": combined,
-            }
-        )
-    return results
-
-
-def routing_cases(skill_dir: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for relative in manifest["routing"]["cases"]:
-        group = load_yaml(skill_dir / "evals" / relative)
-        for case in group["cases"]:
-            result.append({**case, "kind": group["kind"], "expected_activation": group["expected_activation"]})
-    return result
-
-
-def run_routing(skill_dir: Path, manifest: dict[str, Any], run_dir: Path, args: argparse.Namespace) -> list[dict[str, Any]]:
-    trials = args.trials or manifest["routing"].get("trials_per_case", 1)
-    cases = [
-        case for case in routing_cases(skill_dir, manifest)
-        if not args.case or case["id"] in args.case
-    ]
-    jobs = [
-        (profile, case, trial)
-        for profile in args.profile
-        for case in cases
-        for trial in range(1, trials + 1)
-    ]
-
-    def execute(job: tuple[str, dict[str, Any], int]) -> dict[str, Any]:
-        profile, case, trial = job
-        trial_dir = run_dir / "routing" / profile / case["id"] / f"trial-{trial}"
-        output = trial_dir / "executor-output.json"
-        events = trial_dir / "executor-events.jsonl"
-        stderr = trial_dir / "executor-stderr.txt"
-        code = run_codex(
-            prompt=executor_contract_prompt(case["prompt"], None),
-            output_schema=EXECUTOR_SCHEMA,
-            output_path=output,
-            events_path=events,
-            stderr_path=stderr,
-            codex_bin=args.codex_bin,
-            source_home=args.source_codex_home,
-            skill_dir=skill_dir,
-            profile=profile,
-            model=args.model,
-            timeout_seconds=args.timeout_seconds,
-        )
-        activated, evidence = detect_activation(events, skill_dir.name)
-        if code != 0:
-            verdict = "error"
-        else:
-            verdict = "pass" if activated == bool(case["expected_activation"]) else "fail"
-        result = {
-            "case": case["id"],
-            "kind": case["kind"],
-            "critical": bool(case.get("critical")),
-            "profile": profile,
-            "trial": trial,
-            "expected_activation": bool(case["expected_activation"]),
-            "observed_activation": activated,
-            "verdict": verdict,
-            "exit_code": code,
-            "output_path": str(output),
-            "events_path": str(events),
-            "activation_evidence": evidence,
-        }
-        write_yaml(trial_dir / "result.yaml", result)
-        return result
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        results = list(pool.map(execute, jobs))
-    return sorted(results, key=lambda item: (item["profile"], item["kind"], item["case"], item["trial"]))
-
-
-def run_behavior(skill_dir: Path, manifest: dict[str, Any], run_dir: Path, args: argparse.Namespace) -> list[dict[str, Any]]:
-    trials = args.trials or manifest.get("trials_per_task", 1)
-    tasks = []
-    task_paths = list(manifest["tasks"])
-    if args.include_holdout:
-        task_paths.extend(manifest.get("holdout", []))
-    for relative in task_paths:
-        task = load_yaml(skill_dir / "evals" / relative)
-        if args.case and task["id"] not in args.case:
-            continue
-        tasks.append(task)
-    configs = ["with_skill", "without_skill"] if args.baseline else ["with_skill"]
-    jobs = [
-        (task, config, trial)
-        for task in tasks
-        for config in configs
-        for trial in range(1, trials + 1)
-    ]
-
-    def execute(job: tuple[dict[str, Any], str, int]) -> dict[str, Any]:
-        task, config, trial = job
-        trial_dir = run_dir / "behavior" / task["id"] / config / f"trial-{trial}"
-        output_path = trial_dir / "executor-output.json"
-        events = trial_dir / "executor-events.jsonl"
-        stderr = trial_dir / "executor-stderr.txt"
-        started = time.perf_counter()
-        code = run_codex(
-            prompt=executor_contract_prompt(
-                task["scenario"], skill_dir if config == "with_skill" else None
-            ),
-            output_schema=EXECUTOR_SCHEMA,
-            output_path=output_path,
-            events_path=events,
-            stderr_path=stderr,
-            codex_bin=args.codex_bin,
-            source_home=args.source_codex_home,
-            skill_dir=skill_dir if config == "with_skill" else None,
-            profile="isolated",
-            model=args.model,
-            timeout_seconds=args.timeout_seconds,
-        )
-        duration_ms = round((time.perf_counter() - started) * 1000)
-        metrics = event_metrics(events)
-        output = read_json(output_path) if output_path.is_file() else {}
-        semantic_skipped = code != 0
-        if semantic_skipped:
-            # An executor failure already makes the trial fail. Grading an empty or
-            # partial artifact adds latency and can double the timeout without
-            # producing useful evidence.
-            semantic = {"requirements": []}
-            semantic_code = None
-        else:
-            semantic, semantic_code = semantic_grade(
-                task=task, executor_output=output, trial_dir=trial_dir, args=args
-            )
-        grades = merge_requirement_grades(task, output, semantic)
-        critical_ok = code == 0 and semantic_code == 0 and all(
-            item["combined_verdict"] == "pass" for item in grades if item["critical"]
-        )
-        result = {
-            "task": task["id"],
-            "kind": task["kind"],
-            "config": config,
-            "trial": trial,
-            "verdict": "pass" if critical_ok else "fail",
-            "executor_exit_code": code,
-            "semantic_exit_code": semantic_code,
-            "semantic_skipped": semantic_skipped,
-            "output_path": str(output_path),
-            "events_path": str(events),
-            "executor_duration_ms": duration_ms,
-            "executor_tool_uses": metrics["tool_uses"],
-            "executor_usage": metrics["usage"],
-            "phase_trace": output.get("phase_trace", {}),
-            "unclear_points": output.get("unclear_points", []),
-            "discretionary_fill_ins": output.get("discretionary_fill_ins", []),
-            "retries": output.get("retries", {}),
-            "requirements": grades,
-        }
-        write_yaml(trial_dir / "result.yaml", result)
-        return result
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        results = list(pool.map(execute, jobs))
-    return sorted(
-        results,
-        key=lambda item: (item["kind"], item["task"], item["config"], item["trial"]),
-    )
-
-
-def behavior_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
-    summary: dict[str, Any] = {}
-    for config in sorted({item["config"] for item in results}):
-        subset = [item for item in results if item["config"] == config]
-        requirements = [
-            requirement
-            for item in subset
-            for requirement in item.get("requirements", [])
-        ]
-        summary[config] = {
-            "trials": len(subset),
-            "task_pass_rate": (
-                sum(item["verdict"] == "pass" for item in subset) / len(subset)
-                if subset else 0.0
-            ),
-            "requirement_pass_rate": (
-                sum(item["combined_verdict"] == "pass" for item in requirements)
-                / len(requirements)
-                if requirements else 0.0
-            ),
-            "average_duration_ms": (
-                sum(item.get("executor_duration_ms", 0) for item in subset) / len(subset)
-                if subset else 0.0
-            ),
-            "average_tool_uses": (
-                sum(item.get("executor_tool_uses", 0) for item in subset) / len(subset)
-                if subset else 0.0
-            ),
-        }
-    return summary
-
-
-def baseline_delta(summary: dict[str, Any]) -> dict[str, Any]:
-    with_skill = summary.get("with_skill")
-    without_skill = summary.get("without_skill")
-    if not with_skill or not without_skill:
-        return {}
-    return {
-        "task_pass_rate": with_skill["task_pass_rate"] - without_skill["task_pass_rate"],
-        "requirement_pass_rate": (
-            with_skill["requirement_pass_rate"] - without_skill["requirement_pass_rate"]
-        ),
-        "average_duration_ms": (
-            with_skill["average_duration_ms"] - without_skill["average_duration_ms"]
-        ),
-        "average_tool_uses": (
-            with_skill["average_tool_uses"] - without_skill["average_tool_uses"]
-        ),
-    }
-
-
-def routing_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
-    by_profile: dict[str, Any] = {}
-    for profile in sorted({item["profile"] for item in results}):
-        subset = [item for item in results if item["profile"] == profile]
-        kinds: dict[str, Any] = {}
-        for kind in ("positive", "negative", "near-miss"):
-            group = [item for item in subset if item["kind"] == kind]
-            if not group:
-                continue
-            activations = sum(bool(item["observed_activation"]) for item in group)
-            kinds[kind] = {
-                "trials": len(group),
-                "activation_rate": activations / len(group),
-                "pass_rate": sum(item["verdict"] == "pass" for item in group) / len(group),
-            }
-        by_profile[profile] = kinds
-    return by_profile
-
-
-def routing_gates(results: list[dict[str, Any]], manifest: dict[str, Any]) -> dict[str, Any]:
-    thresholds = manifest["routing"]["thresholds"]
-    summary = routing_summary(results)
-    gates: dict[str, Any] = {}
-    for profile, kinds in summary.items():
-        positive = kinds.get("positive", {})
-        negative = kinds.get("negative", {})
-        near_miss = kinds.get("near-miss", {})
-        critical_positive = [
-            item for item in results
-            if item["profile"] == profile and item["kind"] == "positive" and item["critical"]
-        ]
-        checks = {
-            "executor_processes": all(
-                item["exit_code"] == 0 for item in results if item["profile"] == profile
-            ),
-        }
-        # A targeted --case rerun should gate only the kinds it actually ran.
-        # Treating omitted groups as failures makes the supported regression
-        # workflow report a false overall failure.
-        if positive:
-            checks["critical_positive_activation"] = all(
-                item["observed_activation"] and item["exit_code"] == 0
-                for item in critical_positive
-            )
-            checks["positive_activation_rate"] = (
-                positive["activation_rate"] >= thresholds["positive_activation_rate"]
-            )
-        if negative:
-            checks["negative_false_activation_rate"] = (
-                negative["activation_rate"] <= thresholds["negative_false_activation_rate"]
-            )
-        if near_miss:
-            checks["near_miss_false_activation_rate"] = (
-                near_miss["activation_rate"]
-                <= thresholds["near_miss_false_activation_rate"]
-            )
-        gates[profile] = {"checks": checks, "pass": all(checks.values())}
-    return gates
 
 
 def contained_path(path: Path, root: Path) -> str | None:
@@ -612,6 +91,7 @@ def compact_run_record(run_record: dict[str, Any], skill_dir: Path) -> dict[str,
                 "combined_verdict": requirement["combined_verdict"],
                 "text_verdict": requirement.get("text", {}).get("verdict", requirement.get("text_verdict", "unclear")),
                 "semantic_verdict": semantic.get("verdict", requirement.get("semantic_verdict", "unclear")),
+                "objective": requirement.get("objective", []),
             }
             if req["combined_verdict"] != "pass":
                 req["evidence"] = semantic.get("evidence", requirement.get("evidence", ""))
@@ -642,6 +122,7 @@ def compact_run_record(run_record: dict[str, Any], skill_dir: Path) -> dict[str,
             ],
             "retry_count": item.get("retries", {}).get("count", item.get("retry_count", 0)),
             "requirements": requirements,
+            **{key: item[key] for key in ("scenario_sha256", "fixture_sha256", "runtime_skill_sha256", "target_skill_staged", "global_skill_availability", "skill_loaded_observed", "output_error") if key in item},
         })
     return {
         "id": run_record["id"],
@@ -655,6 +136,7 @@ def compact_run_record(run_record: dict[str, Any], skill_dir: Path) -> dict[str,
         "behavior_summary": run_record.get("behavior_summary", {}),
         "baseline_delta": run_record.get("baseline_delta", {}),
         "behavior_trials": behavior_trials,
+        **{key: run_record[key] for key in ("schema_version", "engine", "cli_version", "split", "candidate_sha256", "evaluation_sha256", "decision", "decision_reasons", "case_comparisons", "limitations") if key in run_record},
     }
 
 
@@ -700,143 +182,374 @@ def append_ledger(skill_dir: Path, run_record: dict[str, Any]) -> None:
     write_yaml(ledger_path, ledger)
 
 
-def self_test() -> int:
-    requirement = {
-        "id": "x",
-        "critical": True,
-        "description": "mentions validation",
-        "text": {"regex_any": ["(?i)validat"]},
-        "semantic": {"rubric": "mentions validation"},
-    }
-    output = {"deliverable": "Run validation."}
-    assert text_grade(output, requirement)["verdict"] == "pass"
-    task = {"requirements": [requirement]}
-    semantic = {"requirements": [{"id": "x", "verdict": "pass", "evidence": "present"}]}
-    assert merge_requirement_grades(task, output, semantic)[0]["combined_verdict"] == "pass"
-    summary = behavior_summary([
-        {
-            "config": "with_skill",
-            "verdict": "pass",
-            "requirements": [{"combined_verdict": "pass"}],
-            "executor_duration_ms": 10,
-            "executor_tool_uses": 1,
-        },
-        {
-            "config": "without_skill",
-            "verdict": "fail",
-            "requirements": [{"combined_verdict": "fail"}],
-            "executor_duration_ms": 5,
-            "executor_tool_uses": 0,
-        },
-    ])
-    assert baseline_delta(summary)["task_pass_rate"] == 1.0
-    manifest = {
-        "routing": {
-            "thresholds": {
-                "critical_positive_activation_rate": 1.0,
-                "positive_activation_rate": 0.9,
-                "negative_false_activation_rate": 0.05,
-                "near_miss_false_activation_rate": 0.1,
-            }
-        }
-    }
-    targeted = [{
-        "profile": "isolated",
-        "kind": "near-miss",
-        "critical": False,
-        "observed_activation": False,
-        "exit_code": 0,
-        "verdict": "pass",
-    }]
-    assert routing_gates(targeted, manifest)["isolated"]["pass"] is True
-    print("run_eval self-test passed")
-    return 0
+
+def digest(path):
+    """Hash bytes and relative names, excluding evaluation/history/runtime files."""
+    h = hashlib.sha256()
+    if path.is_file():
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    for item in sorted(path.rglob("*")):
+        if item.is_symlink():
+            h.update(item.relative_to(path).as_posix().encode())
+            h.update(b"symlink-not-followed")
+        elif item.is_file():
+            h.update(item.relative_to(path).as_posix().encode())
+            h.update(b"\0")
+            h.update(item.read_bytes())
+    return h.hexdigest()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+def safe_path(root, relative):
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        raise ValueError("expected nonempty relative path")
+    result = (root / relative).resolve()
+    if contained_path(result, root) is None:
+        raise ValueError(f"path escapes its root: {relative}")
+    return result
+
+
+def stage_tree(source, destination, *, skill=False, evaluation=False):
+    """Copy runtime inputs, not source links, graders, ledgers, or held-out data."""
+    destination.mkdir(parents=True, exist_ok=False)
+    allowed = {"SKILL.md", "references", "scripts", "assets", "agents"}
+    for item in source.iterdir():
+        if evaluation and item.is_dir() and contained_path(destination, item) is not None:
+            continue
+        if (skill and item.name not in allowed) or item.name in {".git", "__pycache__", "evals"} or (evaluation and item.name in {"results", "ledger.yaml", "evidence"}):
+            continue
+        if item.is_symlink() or any(p.is_symlink() for p in item.rglob("*")):
+            raise ValueError(f"staged inputs must not contain symlinks: {item.name}")
+        target = destination / item.name
+        if item.is_dir():
+            shutil.copytree(item, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "evals", ".git"))
+        elif item.is_file():
+            shutil.copy2(item, target)
+
+
+def valid_output(path):
+    """Validate the measured deliverable, independently of claimed phase success."""
+    try:
+        output = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {}, f"missing or malformed executor output: {exc.__class__.__name__}"
+    if not isinstance(output, dict) or not isinstance(output.get("deliverable"), str) or not output["deliverable"].strip():
+        return {}, "executor output must contain a nonempty string deliverable"
+    return output, None
+
+
+def objective_check(check, output, workspace, eval_root, evidence_dir, index):
+    """Grade only the actual deliverable/files, never phase notes or self-scores."""
+    kind = check.get("kind")
+    text = output["deliverable"]
+    detail = ""
+    try:
+        if kind == "contains":
+            passed = check["value"] in text
+        elif kind == "regex":
+            passed = re.search(check["value"], text) is not None
+        elif kind == "json_equals":
+            value = json.loads(text)
+            for segment in check.get("pointer", "").split("/")[1:]:
+                segment = segment.replace("~1", "/").replace("~0", "~")
+                value = value[int(segment)] if isinstance(value, list) else value[segment]
+            passed = value == check["value"]
+        elif kind in {"file_exists", "file_contains"}:
+            path = safe_path(workspace, check["path"])
+            passed = path.is_file()
+            if passed and kind == "file_contains":
+                passed = check["value"] in path.read_text(encoding="utf-8")
+        elif kind == "command":
+            # Local evaluation definitions are trusted code, like repository tests.
+            # Never interpret model output as a command or use shell=True.
+            argv = check["argv"]
+            if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
+                raise ValueError("command check requires nonempty argv string list")
+            argv = [x.replace("{workspace}", str(workspace)).replace("{eval_root}", str(eval_root)) for x in argv]
+            result = subprocess.run(argv, cwd=workspace, capture_output=True, text=True,
+                                    timeout=check.get("timeout_seconds", 30))
+            evidence = evidence_dir / f"check-{index}.txt"
+            evidence.write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
+            passed = result.returncode == 0
+            detail = f"exit={result.returncode}; evidence={evidence.name}"
+        else:
+            raise ValueError(f"unsupported objective kind: {kind}")
+    except (OSError, ValueError, KeyError, TypeError, IndexError, subprocess.TimeoutExpired) as exc:
+        return {"kind": kind, "verdict": "error", "evidence": str(exc)}
+    return {"kind": kind, "verdict": "pass" if passed else "fail", "evidence": detail or f"{kind} on measured deliverable"}
+
+
+def grade_task(task, output, workspace, eval_root, evidence_dir):
+    result = []
+    for req in task["requirements"]:
+        checks = req.get("objective", [])
+        grades = [objective_check(c, output, workspace, eval_root, evidence_dir, f"{req['id']}-{i}") for i, c in enumerate(checks)]
+        if not checks:
+            verdict = "review_required"
+        elif any(g["verdict"] == "error" for g in grades):
+            verdict = "error"
+        else:
+            verdict = "pass" if all(g["verdict"] == "pass" for g in grades) else "fail"
+        result.append({"id": req["id"], "critical": bool(req.get("critical")),
+                       "combined_verdict": verdict, "objective": grades,
+                       "semantic": {"verdict": "unrun", "evidence": "Legacy qualitative rubric requires independent review; no automated semantic adoption gate."}})
+    return result
+
+
+def detect_activation(trace, skill_file, engine="codex"):
+    """Conservative observable read evidence; mentions and failed commands do not count."""
+    import shlex
+    expected = str(skill_file)
+    evidence = []
+    all_events = agent_adapters.events(trace)
+    if engine == "codex":
+        for event in all_events:
+            item = agent_adapters.mapping(event.get("item"))
+            if event.get("type") != "item.completed" or item.get("type") != "command_execution" or item.get("exit_code") != 0:
+                continue
+            try:
+                argv = shlex.split(item.get("command", ""))
+                if len(argv) >= 3 and Path(argv[0]).name in {"bash", "sh", "zsh"} and argv[1] in {"-c", "-lc"}:
+                    argv = shlex.split(argv[2])
+            except ValueError:
+                continue
+            # Do not infer reads from arbitrary shell programs, output, or chains.
+            if len(argv) == 2 and Path(argv[0]).name == "cat" and argv[1] == expected:
+                evidence.append({"type": "successful_read_command", "command": item["command"]})
+    else:
+        requested = {}
+        for event in all_events:
+            for item in agent_adapters.content(event):
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "tool_use" and item.get("name") == "Read" and agent_adapters.mapping(item.get("input")).get("file_path") == expected:
+                    requested[item.get("id")] = item
+                if item.get("type") == "tool_result" and item.get("tool_use_id") in requested and not item.get("is_error", False):
+                    evidence.append({"type": "successful_Read", "tool_use_id": item["tool_use_id"]})
+    return bool(evidence), evidence
+
+
+def selected_tasks(skill, manifest, args):
+    key = {"development": "tasks", "validation": "validation", "holdout": "holdout"}[args.split]
+    paths = manifest.get(key, [])
+    selected = []
+    ids = set()
+    for relative in paths:
+        task = load_yaml(safe_path(skill / "evals", relative))
+        task_id = task.get("id")
+        if not isinstance(task_id, str) or not re.fullmatch(r"[\w .-]+", task_id) or task_id in ids or task_id in {".", ".."}:
+            raise ValueError("task IDs must be unique safe path components")
+        ids.add(task_id)
+        requirements = task.get("requirements")
+        if not isinstance(task.get("scenario"), str) or not task["scenario"].strip() or not isinstance(requirements, list) or not requirements:
+            raise ValueError(f"{task_id}: scenario and nonempty requirements required")
+        req_ids = [req.get("id") for req in requirements if isinstance(req, dict)]
+        if len(req_ids) != len(requirements) or any(not isinstance(x, str) or x in {".", ".."} or not re.fullmatch(r"[\w.-]+", x) for x in req_ids) or len(set(req_ids)) != len(req_ids):
+            raise ValueError(f"{task_id}: invalid or duplicate requirement IDs")
+        if not any(req.get("critical") is True for req in requirements):
+            raise ValueError(f"{task_id}: at least one explicitly critical requirement is required")
+        if not args.case or task_id in args.case:
+            selected.append(task)
+    if not selected:
+        raise ValueError("no evaluation cases selected; nothing was tested")
+    return selected
+
+
+def run_trial(skill, task, arm, frozen_skill, run_dir, args, trial, eval_root):
+    trial_dir = run_dir / "behavior" / task["id"] / arm / f"trial-{trial}"
+    trial_dir.mkdir(parents=True)
+    workspace = trial_dir / "workspace"
+    fixture = task.get("fixture")
+    if fixture:
+        stage_tree(safe_path(eval_root, fixture), workspace)
+    else:
+        workspace.mkdir()
+    fixture_hash = digest(workspace)
+    staged_skill = None
+    if frozen_skill is not None:
+        staged_skill = trial_dir / "runtime-skill" / skill.name
+        stage_tree(frozen_skill, staged_skill, skill=True)
+    runtime_before = digest(staged_skill) if staged_skill else None
+    prompt = task["scenario"] + "\n\nWork in the assigned workspace. Return the actual deliverable and disclose blocked work."
+    if staged_skill:
+        prompt += f"\nUse the skill at {staged_skill / 'SKILL.md'} for this task."
+    output_path = trial_dir / "executor-output.json"
+    trace = trial_dir / "executor-events.jsonl"
+    meta = agent_adapters.execute(engine=args.engine, binary=args.binary, prompt=prompt, workspace=workspace,
+         schema=EXECUTOR_SCHEMA, output=output_path, trace=trace, stderr=trial_dir / "executor-stderr.txt",
+         model=args.model, writable=bool(task.get("workspace_write", False)), timeout=args.timeout_seconds,
+         runtime=trial_dir / "runtime-state", claude_accept_workspace_edits=args.claude_accept_workspace_edits)
+    output, error = valid_output(output_path)
+    if staged_skill and digest(staged_skill) != runtime_before:
+        error = "staged runtime skill changed during execution; contaminated trial"
+    grades = []
+    if meta["exit_code"] == 0 and error is None:
+        grades = grade_task(task, output, workspace, eval_root, trial_dir)
+    if meta["exit_code"] or error or any(g["combined_verdict"] == "error" for g in grades):
+        verdict = "error"
+    elif any(g["combined_verdict"] == "fail" for g in grades):
+        verdict = "fail"
+    elif any(g["combined_verdict"] == "review_required" for g in grades):
+        verdict = "review_required"
+    else:
+        verdict = "pass"
+    activated, evidence = detect_activation(trace, staged_skill / "SKILL.md", args.engine) if staged_skill else (False, [])
+    result = {"task": task["id"], "kind": task.get("kind", args.split), "config": arm,
+        "trial": trial, "verdict": verdict,
+        "critical_regression": any(g["critical"] and g["combined_verdict"] == "fail" for g in grades), "executor_exit_code": meta["exit_code"], "semantic_exit_code": None,
+        "output_error": error, "output_path": str(output_path), "events_path": str(trace),
+        "executor_duration_ms": meta["duration_ms"], "executor_tool_uses": meta["tool_uses"],
+        "executor_usage": meta["usage"], "requirements": grades, "fixture_sha256": fixture_hash,
+        "scenario_sha256": hashlib.sha256(task["scenario"].encode()).hexdigest(),
+        "runtime_skill_sha256": runtime_before,
+        "workspace_after_sha256": digest(workspace), "target_skill_staged": staged_skill is not None, "global_skill_availability": "unverified",
+        "skill_loaded_observed": activated, "activation_evidence": evidence, "execution": meta,
+        "settings_sha256": hashlib.sha256(json.dumps({"engine": args.engine, "model": args.model, "workspace_write": bool(task.get("workspace_write", False)), "timeout_seconds": args.timeout_seconds, "claude_accept_workspace_edits": args.claude_accept_workspace_edits}, sort_keys=True).encode()).hexdigest()}
+    write_yaml(trial_dir / "result.yaml", result)
+    return result
+
+
+def summarize(results):
+    summary = {}
+    for arm in sorted({r["config"] for r in results}):
+        group = [r for r in results if r["config"] == arm]
+        summary[arm] = {"trials": len(group), "passed": sum(r["verdict"] == "pass" for r in group),
+                        "failed": sum(r["verdict"] == "fail" for r in group),
+                        "errors": sum(r["verdict"] == "error" for r in group),
+                        "review_required": sum(r["verdict"] == "review_required" for r in group),
+                        "duration_ms": sum(r["executor_duration_ms"] for r in group)}
+    pairs = []
+    for r in results:
+        if r["config"] != "candidate":
+            continue
+        for other in ("no_skill", "previous"):
+            match = next((x for x in results if x["task"] == r["task"] and x["trial"] == r["trial"] and x["config"] == other), None)
+            if match:
+                valid = r["verdict"] in {"pass", "fail"} and match["verdict"] in {"pass", "fail"}
+                relation = "inconclusive" if not valid else "tie" if r["verdict"] == match["verdict"] else "win" if r["verdict"] == "pass" else "loss"
+                before = {g["id"]: g for g in match.get("requirements", [])}
+                regressions = [g["id"] for g in r.get("requirements", []) if g["combined_verdict"] == "fail" and before.get(g["id"], {}).get("combined_verdict") == "pass"]
+                improvements = [g["id"] for g in r.get("requirements", []) if g["combined_verdict"] == "pass" and before.get(g["id"], {}).get("combined_verdict") == "fail"]
+                pairs.append({"task": r["task"], "trial": r["trial"], "against": other, "result": relation,
+                    "requirement_regressions": regressions, "requirement_improvements": improvements,
+                    "critical_regressions": [g["id"] for g in r.get("requirements", []) if g["id"] in regressions and g["critical"]]})
+    return summary, pairs
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("skill_directory", nargs="?", type=Path)
-    parser.add_argument("--mode", choices=("routing", "behavior", "all"), default="all")
-    parser.add_argument("--profile", action="append", choices=("isolated", "normal"))
-    parser.add_argument("--trials", type=int)
+    parser.add_argument("--engine", choices=("codex", "claude"), default="codex")
+    parser.add_argument("--binary", help="existing official agent executable")
+    parser.add_argument("--claude-accept-workspace-edits", action="store_true", help="explicitly approve Claude file edits in disposable trial workspaces; no shell tools")
+    parser.add_argument("--model", help="pin model for matched comparisons")
+    parser.add_argument("--previous-skill", type=Path, help="frozen previous accepted skill for revision comparisons")
+    parser.add_argument("--baseline", action="store_true", help="include matched no-target-skill arm")
+    parser.add_argument("--split", choices=("development", "validation", "holdout"), default="development")
+    parser.add_argument("--candidate-frozen", action="store_true", help="declare candidate selected before opening held-out cases")
     parser.add_argument("--case", action="append")
-    parser.add_argument("--results-dir", type=Path)
-    parser.add_argument("--source-codex-home", type=Path, default=Path.home() / ".codex")
-    parser.add_argument("--codex-bin", default="codex")
-    parser.add_argument("--model")
+    parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=int, default=180)
-    parser.add_argument("--jobs", type=int, default=1)
-    parser.add_argument("--include-holdout", action="store_true")
-    parser.add_argument("--baseline", action="store_true")
+    parser.add_argument("--results-dir", type=Path)
     parser.add_argument("--no-ledger", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--mode", choices=("behavior",), default="behavior", help="behavior only; routing needs verified native discovery")
     return parser.parse_args()
 
 
-def main() -> int:
+def self_test():
+    import tempfile
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        out = {"deliverable": "actual outcome", "phase_trace": {"success": "magic keyword"}}
+        assert objective_check({"kind": "contains", "value": "magic keyword"}, out, root, root, root, 0)["verdict"] == "fail"
+        assert objective_check({"kind": "file_exists", "path": "missing.txt"}, out, root, root, root, 1)["verdict"] == "fail"
+        assert valid_output(root / "missing.json")[1]
+    print("run_eval self-test passed (infrastructure only; no model execution)")
+    return 0
+
+
+def main():
     args = parse_args()
+    run_dir = None
     if args.self_test:
         return self_test()
-    if args.skill_directory is None:
-        print("error: skill_directory is required", file=sys.stderr)
+    try:
+        if args.skill_directory is None or args.trials < 1 or args.timeout_seconds < 1:
+            raise ValueError("skill_directory, positive trials, and positive timeout required")
+        if args.claude_accept_workspace_edits and args.engine != "claude":
+            raise ValueError("--claude-accept-workspace-edits applies only to --engine claude")
+        if args.split == "holdout" and not args.candidate_frozen:
+            raise ValueError("holdout requires --candidate-frozen; do not tune against final test cases")
+        skill = args.skill_directory.expanduser().resolve()
+        errors = validate_skill.validate(skill)
+        if errors:
+            raise ValueError("invalid evaluation package: " + "; ".join(errors))
+        manifest = load_yaml(skill / "evals/eval.yaml")
+        if manifest.get("version", 2) not in (2, 3):
+            raise ValueError("unsupported manifest version")
+        tasks = selected_tasks(skill, manifest, args)
+        args.binary = args.binary or args.engine
+        results_root = (args.results_dir or skill / "evals/results").expanduser().resolve()
+        run_id = utc_stamp() + "-" + uuid.uuid4().hex[:12]
+        run_dir = results_root / run_id
+        run_dir.mkdir(parents=True, exist_ok=False)
+        frozen = run_dir / "inputs/candidate"
+        stage_tree(skill, frozen, skill=True)
+        arms = {"candidate": frozen}
+        if args.baseline or args.previous_skill:
+            arms = {"no_skill": None, **arms}
+        if args.previous_skill:
+            previous = run_dir / "inputs/previous"
+            stage_tree(args.previous_skill.expanduser().resolve(), previous, skill=True)
+            arms["previous"] = previous
+        # Copy evaluation definitions for reproducibility, never into executor runtime.
+        evaluation_snapshot = run_dir / "evaluation-inputs"
+        stage_tree(skill / "evals", evaluation_snapshot, evaluation=True)
+        write_yaml(evaluation_snapshot / "manifest.yaml", manifest)
+        write_yaml(evaluation_snapshot / "selected-tasks.yaml", {"tasks": tasks})
+        version = agent_adapters.inspect_cli(args.binary)
+        trials = []
+        for task in tasks:
+            for trial in range(1, args.trials + 1):
+                ordered = list(arms.items())
+                # Counterbalance simple order effects across repeat trials.
+                if trial % 2 == 0:
+                    ordered.reverse()
+                for arm, runtime_skill in ordered:
+                    trials.append(run_trial(skill, task, arm, runtime_skill, run_dir, args, trial, evaluation_snapshot))
+        summary, pairs = summarize(trials)
+        blocked = any(t["verdict"] == "error" for t in trials)
+        failed = any(t["verdict"] == "fail" and t["config"] == "candidate" for t in trials)
+        decision = "blocked" if blocked else "reject_candidate" if failed or any(p["result"] == "loss" for p in pairs) else "inconclusive"
+        reasons = ["No automatic adoption. Global skills and filesystem isolation are not verified."]
+        if not args.model:
+            reasons.append("Default model was not explicitly pinned.")
+        if not args.baseline and not args.previous_skill:
+            reasons.append("No matched baseline requested.")
+        if args.split != "holdout":
+            reasons.append("This is not a final held-out experiment.")
+        if any(t["verdict"] == "review_required" for t in trials):
+            reasons.append("Some requirements need independent qualitative review; legacy semantic-only evidence was not regraded.")
+        record = {"schema_version": 3, "id": run_id, "mode": "behavior", "engine": args.engine,
+          "cli_version": version, "model": args.model or "unresolved-default", "split": args.split,
+          "results_dir": str(run_dir), "candidate_sha256": digest(frozen),
+          "evaluation_sha256": digest(evaluation_snapshot), "routing_summary": {}, "routing_gates": {},
+          "routing_trials": [], "behavior_summary": summary, "baseline_delta": {}, "case_comparisons": pairs,
+          "behavior_trials": trials, "decision": decision, "decision_reasons": reasons,
+          "limitations": ["Runtime-only staging is not an access-control boundary.",
+            "Existing authenticated context retained; no credentials read or reconfigured.",
+            "Native discovery/routing is untested by this behavior runner."]}
+        write_yaml(run_dir / "summary.yaml", record)
+        if not args.no_ledger:
+            append_ledger(skill, record)
+        print(json.dumps({"id": run_id, "results_dir": str(run_dir), "decision": decision,
+            "behavior_summary": summary, "case_comparisons": pairs, "reasons": reasons}, indent=2))
+        return 2 if blocked else 1 if failed else 3
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.SubprocessError) as exc:
+        if run_dir is not None:
+            write_yaml(run_dir / "summary.yaml", {"schema_version": 3, "decision": "blocked", "error": str(exc), "behaviorally_validated": False})
+        print(f"error: {exc}", file=sys.stderr)
         return 2
-    if args.trials is not None and args.trials < 1:
-        print("error: --trials must be positive", file=sys.stderr)
-        return 2
-    if args.jobs < 1:
-        print("error: --jobs must be positive", file=sys.stderr)
-        return 2
-    if args.timeout_seconds < 1:
-        print("error: --timeout-seconds must be positive", file=sys.stderr)
-        return 2
-    if args.baseline and args.mode == "routing":
-        print("error: --baseline applies only to behavior evaluation", file=sys.stderr)
-        return 2
-    skill_dir = args.skill_directory.expanduser().resolve()
-    manifest = load_yaml(skill_dir / "evals" / "eval.yaml")
-    args.source_codex_home = args.source_codex_home.expanduser().resolve()
-    args.profile = args.profile or manifest.get("routing", {}).get("profiles", ["isolated"])
-    run_id = utc_stamp()
-    results_root = (args.results_dir or skill_dir / "evals" / "results").expanduser().resolve()
-    run_dir = results_root / run_id
-    routing: list[dict[str, Any]] = []
-    behavior: list[dict[str, Any]] = []
-    if args.mode in ("routing", "all"):
-        routing = run_routing(skill_dir, manifest, run_dir, args)
-    if args.mode in ("behavior", "all"):
-        behavior = run_behavior(skill_dir, manifest, run_dir, args)
-    behavior_stats = behavior_summary(behavior)
-    record = {
-        "id": run_id,
-        "mode": args.mode,
-        "model": args.model or "default",
-        "results_dir": str(run_dir),
-        "routing_summary": routing_summary(routing),
-        "routing_gates": routing_gates(routing, manifest) if routing else {},
-        "routing_trials": routing,
-        "behavior_summary": behavior_stats,
-        "baseline_delta": baseline_delta(behavior_stats),
-        "behavior_trials": behavior,
-    }
-    write_yaml(run_dir / "summary.yaml", record)
-    if not args.no_ledger:
-        append_ledger(skill_dir, record)
-    routing_failed = any(not gate["pass"] for gate in record["routing_gates"].values())
-    behavior_failed = any(
-        item["verdict"] != "pass" and item.get("config") == "with_skill"
-        for item in behavior
-    )
-    failed = routing_failed or behavior_failed
-    print(json.dumps({
-        "id": run_id,
-        "results_dir": str(run_dir),
-        "routing_gates": record["routing_gates"],
-        "routing_trial_count": len(routing),
-        "behavior_trial_count": len(behavior),
-        "behavior_summary": record["behavior_summary"],
-        "baseline_delta": record["baseline_delta"],
-    }, ensure_ascii=False, indent=2))
-    return 1 if failed else 0
 
 
 if __name__ == "__main__":

@@ -58,9 +58,14 @@ that `/eli5` is not a command in the shared instructions describe Codex only.
 All six local skills have standard `name` and `description` frontmatter, but
 being discoverable does not guarantee every workflow is agent-independent:
 
-- `create-validated-skill` intentionally targets Codex skills. Its evaluation
-  scripts use `codex exec` and need a separately installed/authenticated Codex CLI
-  plus Python/PyYAML. Linking it does not provide Claude-native model evaluation.
+- `create-validated-skill` shares its creation workflow and evaluation manifests
+  across both agents. Its runner has separate `--engine codex` and `--engine claude`
+  adapters and needs Python/PyYAML plus the selected, already authenticated CLI.
+  Package compatibility and adapter unit tests do not establish real Claude model
+  validation. Claude writes are blocked by default. Explicit
+  `--claude-accept-workspace-edits` enables files-only edits in disposable trial
+  workspaces using per-run `acceptEdits`; no shell tools or permission bypass. The runner never configures login or copies credentials. See the
+  [evaluation protocol](../skills-local/.codex/skills/create-validated-skill/references/evaluation-schema.md).
 - `pi-extension-development` requires the target Pi environment and behavior
   tests; `herdr` requires Herdr for actual operations.
 - `eli5`, `design-python-code`, and `sanitize-artifacts` primarily contain

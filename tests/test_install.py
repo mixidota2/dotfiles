@@ -40,6 +40,35 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(self.target.is_symlink())
         self.assertEqual(os.readlink(self.target), str(REPO / "orca" / ORCA))
 
+    def test_herdr_install_uses_official_formula(self):
+        brewfile = (REPO / "Brewfile").read_text()
+        formulas = re.findall(r'^\s*brew\s+["\']([^"\']+)["\']', brewfile, re.MULTILINE)
+        casks = re.findall(r'^\s*cask\s+["\']([^"\']+)["\']', brewfile, re.MULTILINE)
+        self.assertEqual(formulas.count("herdr"), 1)
+        self.assertNotIn("herdr", casks)
+
+    def test_install_links_herdr_and_preserves_runtime_state(self):
+        config = Path(".config/herdr/config.toml")
+        target = self.home / config
+        target.parent.mkdir(parents=True)
+        target.write_text("# previous local configuration\n")
+        sentinels = [target.parent / "sessions/state.json",
+                     target.parent / "logs/herdr.log",
+                     self.home / ".local/share/herdr/session.db",
+                     self.home / ".local/state/herdr/private-state"]
+        for path in sentinels:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("local runtime sentinel\n")
+        self.install()
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(os.readlink(target), str(REPO / "herdr" / config))
+        self.assertEqual((self.backups / config).read_text(), "# previous local configuration\n")
+        for path in sentinels:
+            self.assertEqual(path.read_text(), "local runtime sentinel\n")
+        repeated = self.install()
+        self.assertNotIn("backup  ", repeated)
+        self.assertNotIn("link    ", repeated)
+
     def test_orca_install_uses_official_qualified_cask(self):
         brewfile = (REPO / "Brewfile").read_text()
         taps = re.findall(r'^\s*tap\s+[\"\']([^\"\']+)[\"\']', brewfile, re.MULTILINE)
