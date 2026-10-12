@@ -6,11 +6,14 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import uuid
 from typing import Any
 
@@ -26,6 +29,7 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent.parent
 EXECUTOR_SCHEMA = ROOT / "assets" / "executor-output.schema.json"
 GRADER_SCHEMA = ROOT / "assets" / "semantic-grade.schema.json"
+TREE_DIGEST_FORMAT = "sha256-tree-manifest-v2"
 
 def load_yaml(path: Path) -> dict[str, Any]:
     if yaml is None:
@@ -136,7 +140,7 @@ def compact_run_record(run_record: dict[str, Any], skill_dir: Path) -> dict[str,
         "behavior_summary": run_record.get("behavior_summary", {}),
         "baseline_delta": run_record.get("baseline_delta", {}),
         "behavior_trials": behavior_trials,
-        **{key: run_record[key] for key in ("schema_version", "engine", "cli_version", "split", "candidate_sha256", "evaluation_sha256", "decision", "decision_reasons", "case_comparisons", "limitations") if key in run_record},
+        **{key: run_record[key] for key in ("schema_version", "engine", "cli_version", "split", "tree_digest_format", "candidate_sha256", "evaluation_sha256", "input_freeze", "decision", "decision_reasons", "case_comparisons", "limitations") if key in run_record},
     }
 
 
@@ -145,7 +149,7 @@ def update_failure_patterns(ledger: dict[str, Any], run_record: dict[str, Any]) 
     by_rule = {item["general_fix_rule"]: item for item in patterns}
     occurrences = []
     for trial in run_record["behavior_trials"]:
-        if trial.get("config", "with_skill") != "with_skill":
+        if trial.get("config", "with_skill") not in {"with_skill", "candidate"}:
             continue
         for issue in trial.get("unclear_points", []):
             occurrences.append((trial, "executor", issue))
@@ -153,6 +157,10 @@ def update_failure_patterns(ledger: dict[str, Any], run_record: dict[str, Any]) 
             semantic = requirement.get("semantic", {})
             if semantic.get("verdict") in ("fail", "unclear") and semantic.get("general_fix_rule"):
                 occurrences.append((trial, requirement["id"], semantic))
+            elif requirement.get("combined_verdict") in ("fail", "unclear", "review_required") and requirement.get("general_fix_rule"):
+                occurrences.append((trial, requirement["id"], requirement))
+            # Objective failures alone establish an observation, not a general
+            # remedy. Preserve them in behavior_trials without inventing a rule.
     for trial, source, issue in occurrences:
         rule = issue.get("general_fix_rule", "").strip()
         if not rule:
@@ -184,19 +192,33 @@ def append_ledger(skill_dir: Path, run_record: dict[str, Any]) -> None:
 
 
 def digest(path):
-    """Hash bytes and relative names, excluding evaluation/history/runtime files."""
-    h = hashlib.sha256()
-    if path.is_file():
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    for item in sorted(path.rglob("*")):
-        if item.is_symlink():
-            h.update(item.relative_to(path).as_posix().encode())
-            h.update(b"symlink-not-followed")
-        elif item.is_file():
-            h.update(item.relative_to(path).as_posix().encode())
-            h.update(b"\0")
-            h.update(item.read_bytes())
-    return h.hexdigest()
+    """Hash an unambiguous manifest of a staged tree, including empty directories."""
+    entries = []
+    items = [path]
+    while items:
+        item = items.pop()
+        mode = item.lstat().st_mode  # Never dereference a workspace symlink.
+        # Staging excludes these generated directories. Normal Python imports
+        # may recreate them; they are not source inputs. A same-name symlink or
+        # file is still hashed so replacing a directory with one is detectable.
+        if item != path and item.name == "__pycache__" and stat.S_ISDIR(mode):
+            continue
+        entry = {"path": item.relative_to(path).as_posix()}
+        if stat.S_ISLNK(mode):
+            entry.update(type="symlink", target=os.readlink(item))
+        elif stat.S_ISDIR(mode):
+            entry.update(type="directory", executable_bits=mode & 0o111)
+            items.extend(item.iterdir())
+        elif stat.S_ISREG(mode):
+            entry.update(type="file", executable_bits=mode & 0o111,
+                         sha256=hashlib.sha256(item.read_bytes()).hexdigest())
+        else:
+            raise ValueError(f"unsupported snapshot entry type: {entry['path']}")
+        entries.append(entry)
+    entries.sort(key=lambda entry: entry["path"])
+    manifest = {"format": TREE_DIGEST_FORMAT, "entries": entries}
+    encoded = json.dumps(manifest, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def safe_path(root, relative):
@@ -224,6 +246,36 @@ def stage_tree(source, destination, *, skill=False, evaluation=False):
             shutil.copytree(item, target, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "evals", ".git"))
         elif item.is_file():
             shutil.copy2(item, target)
+
+
+def freeze_inputs(skill, destination):
+    """Record input identity without running an agent or overwriting evidence."""
+    if contained_path(destination, skill) is not None:
+        raise ValueError("freeze record must be outside the skill package")
+    with tempfile.TemporaryDirectory(prefix="skill-freeze-") as raw:
+        root = Path(raw)
+        stage_tree(skill, root / "candidate", skill=True)
+        stage_tree(skill / "evals", root / "evaluation", evaluation=True)
+        record = {"version": 2, "tree_digest_format": TREE_DIGEST_FORMAT, "created_at": utc_stamp(),
+                  "candidate_sha256": digest(root / "candidate"),
+                  "evaluation_sha256": digest(root / "evaluation")}
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("x", encoding="utf-8") as stream:
+        json.dump(record, stream, indent=2)
+        stream.write("\n")
+    return record
+
+
+def verify_frozen_inputs(path, candidate, evaluation):
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(record, dict) or type(record.get("version")) is not int:
+        raise ValueError("invalid input freeze record")
+    if record["version"] != 2 or record.get("tree_digest_format") != TREE_DIGEST_FORMAT:
+        raise ValueError("unsupported input freeze format; preserve the old record and re-freeze with --freeze-inputs to a new path (version 2 required)")
+    for key, directory in (("candidate_sha256", candidate), ("evaluation_sha256", evaluation)):
+        if record.get(key) != digest(directory):
+            raise ValueError(f"frozen input mismatch: {key}; edits require a new experiment")
+    return record
 
 
 def valid_output(path):
@@ -328,13 +380,13 @@ def detect_activation(trace, skill_file, engine="codex"):
     return bool(evidence), evidence
 
 
-def selected_tasks(skill, manifest, args):
+def selected_tasks(skill, manifest, args, eval_root=None):
     key = {"development": "tasks", "validation": "validation", "holdout": "holdout"}[args.split]
     paths = manifest.get(key, [])
     selected = []
     ids = set()
     for relative in paths:
-        task = load_yaml(safe_path(skill / "evals", relative))
+        task = load_yaml(safe_path(eval_root or skill / "evals", relative))
         task_id = task.get("id")
         if not isinstance(task_id, str) or not re.fullmatch(r"[\w .-]+", task_id) or task_id in ids or task_id in {".", ".."}:
             raise ValueError("task IDs must be unique safe path components")
@@ -442,10 +494,12 @@ def parse_args():
     parser.add_argument("--binary", help="existing official agent executable")
     parser.add_argument("--claude-accept-workspace-edits", action="store_true", help="explicitly approve Claude file edits in disposable trial workspaces; no shell tools")
     parser.add_argument("--model", help="pin model for matched comparisons")
-    parser.add_argument("--previous-skill", type=Path, help="frozen previous accepted skill for revision comparisons")
-    parser.add_argument("--baseline", action="store_true", help="include matched no-target-skill arm")
+    parser.add_argument("--previous-skill", type=Path, help="compare candidate with frozen previous version; does not add a no-skill arm")
+    parser.add_argument("--baseline", action="store_true", help="explicitly add a matched no-target-skill arm, including alongside --previous-skill")
     parser.add_argument("--split", choices=("development", "validation", "holdout"), default="development")
-    parser.add_argument("--candidate-frozen", action="store_true", help="declare candidate selected before opening held-out cases")
+    parser.add_argument("--candidate-frozen", action="store_true", help="deprecated declaration; holdout still requires --frozen-inputs")
+    parser.add_argument("--freeze-inputs", type=Path, help="write a new candidate/evaluation hash record outside the skill, then exit without agent calls")
+    parser.add_argument("--frozen-inputs", type=Path, help="verify against a prior freeze record; required for holdout")
     parser.add_argument("--case", action="append")
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=int, default=180)
@@ -478,16 +532,18 @@ def main():
             raise ValueError("skill_directory, positive trials, and positive timeout required")
         if args.claude_accept_workspace_edits and args.engine != "claude":
             raise ValueError("--claude-accept-workspace-edits applies only to --engine claude")
-        if args.split == "holdout" and not args.candidate_frozen:
-            raise ValueError("holdout requires --candidate-frozen; do not tune against final test cases")
+        if args.freeze_inputs and args.frozen_inputs:
+            raise ValueError("choose --freeze-inputs or --frozen-inputs, not both")
+        if args.split == "holdout" and not args.frozen_inputs and not args.freeze_inputs:
+            raise ValueError("holdout requires --frozen-inputs from a prior freeze; --candidate-frozen alone is insufficient")
         skill = args.skill_directory.expanduser().resolve()
         errors = validate_skill.validate(skill)
         if errors:
             raise ValueError("invalid evaluation package: " + "; ".join(errors))
-        manifest = load_yaml(skill / "evals/eval.yaml")
-        if manifest.get("version", 2) not in (2, 3):
-            raise ValueError("unsupported manifest version")
-        tasks = selected_tasks(skill, manifest, args)
+        if args.freeze_inputs:
+            record = freeze_inputs(skill, args.freeze_inputs.expanduser().resolve())
+            print(json.dumps(record, indent=2))
+            return 0
         args.binary = args.binary or args.engine
         results_root = (args.results_dir or skill / "evals/results").expanduser().resolve()
         run_id = utc_stamp() + "-" + uuid.uuid4().hex[:12]
@@ -496,7 +552,7 @@ def main():
         frozen = run_dir / "inputs/candidate"
         stage_tree(skill, frozen, skill=True)
         arms = {"candidate": frozen}
-        if args.baseline or args.previous_skill:
+        if args.baseline:
             arms = {"no_skill": None, **arms}
         if args.previous_skill:
             previous = run_dir / "inputs/previous"
@@ -505,8 +561,15 @@ def main():
         # Copy evaluation definitions for reproducibility, never into executor runtime.
         evaluation_snapshot = run_dir / "evaluation-inputs"
         stage_tree(skill / "evals", evaluation_snapshot, evaluation=True)
+        input_freeze = verify_frozen_inputs(args.frozen_inputs.expanduser(), frozen, evaluation_snapshot) if args.frozen_inputs else None
+        manifest = load_yaml(evaluation_snapshot / "eval.yaml")
+        if manifest.get("version", 2) not in (2, 3):
+            raise ValueError("unsupported manifest version")
+        tasks = selected_tasks(skill, manifest, args, evaluation_snapshot)
         write_yaml(evaluation_snapshot / "manifest.yaml", manifest)
         write_yaml(evaluation_snapshot / "selected-tasks.yaml", {"tasks": tasks})
+        evaluation_hash = digest(evaluation_snapshot)
+        arm_hashes = {arm: digest(path) for arm, path in arms.items() if path is not None}
         version = agent_adapters.inspect_cli(args.binary)
         trials = []
         for task in tasks:
@@ -517,6 +580,8 @@ def main():
                     ordered.reverse()
                 for arm, runtime_skill in ordered:
                     trials.append(run_trial(skill, task, arm, runtime_skill, run_dir, args, trial, evaluation_snapshot))
+        if digest(evaluation_snapshot) != evaluation_hash or any(digest(arms[arm]) != value for arm, value in arm_hashes.items()):
+            raise ValueError("frozen experiment inputs changed during execution; contaminated run")
         summary, pairs = summarize(trials)
         blocked = any(t["verdict"] == "error" for t in trials)
         failed = any(t["verdict"] == "fail" and t["config"] == "candidate" for t in trials)
@@ -531,9 +596,10 @@ def main():
         if any(t["verdict"] == "review_required" for t in trials):
             reasons.append("Some requirements need independent qualitative review; legacy semantic-only evidence was not regraded.")
         record = {"schema_version": 3, "id": run_id, "mode": "behavior", "engine": args.engine,
+          "tree_digest_format": TREE_DIGEST_FORMAT,
           "cli_version": version, "model": args.model or "unresolved-default", "split": args.split,
           "results_dir": str(run_dir), "candidate_sha256": digest(frozen),
-          "evaluation_sha256": digest(evaluation_snapshot), "routing_summary": {}, "routing_gates": {},
+          "evaluation_sha256": evaluation_hash, "input_freeze": input_freeze, "routing_summary": {}, "routing_gates": {},
           "routing_trials": [], "behavior_summary": summary, "baseline_delta": {}, "case_comparisons": pairs,
           "behavior_trials": trials, "decision": decision, "decision_reasons": reasons,
           "limitations": ["Runtime-only staging is not an access-control boundary.",

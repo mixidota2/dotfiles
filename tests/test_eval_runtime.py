@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -190,5 +191,350 @@ class RuntimeTests(unittest.TestCase):
     def test_baseline_error_makes_comparison_inconclusive(self):
         trials=[{'config':arm,'task':'t','trial':1,'verdict':verdict,'executor_duration_ms':1} for arm,verdict in [('candidate','pass'),('no_skill','error')]]
         self.assertEqual(r.summarize(trials)[1][0]['result'],'inconclusive')
+
+    def test_failure_patterns_accept_current_and_legacy_candidate_labels_only(self):
+        trials = []
+        for arm in ('candidate', 'with_skill', 'previous', 'no_skill'):
+            trials.append({'config': arm, 'task': arm, 'trial': 1, 'requirements': [
+                {'id': 'legacy', 'semantic': {'verdict': 'fail', 'general_fix_rule': 'Check the stated unit.'}},
+                {'id': 'current', 'combined_verdict': 'fail', 'general_fix_rule': 'Respect required ordering.'},
+                {'id': 'observation', 'combined_verdict': 'fail', 'objective': [{'verdict': 'fail'}]},
+            ]})
+        ledger = {'failure_patterns': []}
+        r.update_failure_patterns(ledger, {'id': 'run', 'behavior_trials': trials})
+        self.assertEqual(len(ledger['failure_patterns']), 2)
+        for pattern in ledger['failure_patterns']:
+            self.assertEqual([x['task'] for x in pattern['seen_in']], ['candidate', 'with_skill'])
+
+
+class SnapshotDigestTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_file_boundaries_cannot_alias_content_and_path_bytes(self):
+        single, multiple = self.root / 'single', self.root / 'multiple'
+        single.mkdir()
+        multiple.mkdir()
+        (single / 'a').write_bytes(b'payloadb\0second')
+        (multiple / 'a').write_bytes(b'payload')
+        (multiple / 'b').write_bytes(b'second')
+        self.assertNotEqual(r.digest(single), r.digest(multiple))
+
+    def test_empty_directories_and_entry_types_affect_identity(self):
+        empty = r.digest(self.root)
+        entry = self.root / 'a'
+        entry.mkdir()
+        directory = r.digest(self.root)
+        self.assertNotEqual(empty, directory)
+        entry.rmdir()
+        entry.touch()
+        self.assertNotEqual(r.digest(self.root), directory)
+
+    def test_each_execute_bit_affects_identity(self):
+        entry = self.root / 'helper.py'
+        entry.write_text('print("hello")')
+        entry.chmod(0o644)
+        original = r.digest(self.root)
+        for mode in (0o744, 0o654, 0o645, 0o755):
+            entry.chmod(mode)
+            self.assertNotEqual(r.digest(self.root), original)
+
+    def test_relocation_and_creation_order_do_not_affect_identity(self):
+        first, second = self.root / 'first', self.root / 'second'
+        first.mkdir()
+        second.mkdir()
+        names = ('a', 'quote"newline\n日本語')
+        for directory, order in ((first, names), (second, reversed(names))):
+            for name in order:
+                entry = directory / name
+                entry.write_text(name)
+                entry.chmod(0o644)
+        self.assertEqual(r.digest(first), r.digest(second))
+
+    def test_symlink_target_is_hashed_without_dereferencing(self):
+        link = self.root / 'link'
+        link.symlink_to('missing-one')
+        first = r.digest(self.root)
+        link.unlink()
+        link.symlink_to('missing-two')
+        self.assertNotEqual(r.digest(self.root), first)
+        self.assertNotEqual(r.digest(link), r.digest(self.root))
+        link.unlink()
+        link.symlink_to('missing//two')
+        literal = r.digest(self.root)
+        link.unlink()
+        link.symlink_to('missing/two')
+        self.assertNotEqual(r.digest(self.root), literal)
+
+    def test_cache_directory_is_excluded_but_same_name_file_or_link_is_not(self):
+        original = r.digest(self.root)
+        cache = self.root / '__pycache__'
+        cache.mkdir()
+        (cache / 'helper.cpython.pyc').write_bytes(b'generated')
+        self.assertEqual(r.digest(self.root), original)
+        (cache / 'helper.cpython.pyc').unlink()
+        cache.rmdir()
+        cache.write_text('not a cache directory')
+        self.assertNotEqual(r.digest(self.root), original)
+        cache.unlink()
+        cache.symlink_to('missing')
+        self.assertNotEqual(r.digest(self.root), original)
+
+
+class FrozenInputTests(unittest.TestCase):
+    """Exercise the full runner with fake transport; never start an agent CLI."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.skill = self.root / 'sample'
+        self.skill.mkdir()
+        (self.skill / 'SKILL.md').write_text('---\nname: sample\ndescription: Test input freezing.\n---\nUse the input.')
+        r.write_yaml(self.skill / 'evals/eval.yaml', {
+            'name': 'sample', 'version': 3, 'holdout': ['tasks/final.yaml']})
+        r.write_yaml(self.skill / 'evals/tasks/final.yaml', {
+            'id': 'final', 'kind': 'holdout', 'scenario': 'Return actual.', 'fixture': 'fixtures/input',
+            'requirements': [{'id': 'exact', 'critical': True, 'description': 'Exact answer',
+                              'objective': [{'kind': 'contains', 'value': 'actual'}]}]})
+        fixture = self.skill / 'evals/fixtures/input'
+        fixture.mkdir(parents=True)
+        (fixture / 'input.txt').write_text('input')
+        self.lock = self.root / 'frozen.json'
+
+    def run_main(self, *args, execute=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(r.sys, 'argv', [str(SCRIPTS / 'run_eval.py'), str(self.skill), *args]), \
+             mock.patch.object(a, 'inspect_cli', return_value='fake-cli') as inspect, \
+             mock.patch.object(a, 'execute', side_effect=execute or AssertionError('must not execute')) as call, \
+             contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = r.main()
+        return code, stdout.getvalue(), stderr.getvalue(), inspect.call_count, call.call_count
+
+    @staticmethod
+    def execute(**kw):
+        kw['output'].write_text(json.dumps({'deliverable': 'actual'}))
+        kw['trace'].write_text(json.dumps({'type': 'turn.completed'}))
+        return {'exit_code': 0, 'duration_ms': 1, 'tool_uses': 0, 'usage': {}}
+
+    def freeze(self):
+        result = self.run_main('--freeze-inputs', str(self.lock))
+        self.assertEqual((result[0], result[3], result[4]), (0, 0, 0), result)
+        return self.lock.read_bytes()
+
+    def test_declaration_alone_cannot_run_holdout(self):
+        for args in ([], ['--candidate-frozen']):
+            result = self.run_main('--split', 'holdout', *args)
+            self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+            self.assertIn('--frozen-inputs', result[2])
+
+    def test_record_never_overwrites_and_matching_inputs_remain_inconclusive(self):
+        before = self.freeze()
+        result = self.run_main('--freeze-inputs', str(self.lock))
+        self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+        self.assertEqual(self.lock.read_bytes(), before)
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock),
+                               '--baseline', '--model', 'fake', execute=self.execute)
+        self.assertEqual((result[0], result[3], result[4]), (3, 1, 2), result)
+        summary = r.load_yaml(Path(json.loads(result[1])['results_dir']) / 'summary.yaml')
+        self.assertEqual(summary['input_freeze'], json.loads(before))
+        self.assertEqual(summary['input_freeze']['version'], 2)
+        self.assertEqual(summary['tree_digest_format'], r.TREE_DIGEST_FORMAT)
+        self.assertEqual(summary['decision'], 'inconclusive')
+        # Appending evidence/ledger must not invalidate the source input record.
+        again = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=self.execute)
+        self.assertEqual(again[0], 3, again)
+
+    def test_comparison_arms_are_explicit_and_revisions_need_only_two(self):
+        self.freeze()
+        previous = ('--previous-skill', str(self.skill))
+        for options, arms, comparisons in (
+            ((), {'candidate'}, set()),
+            (('--baseline',), {'candidate', 'no_skill'}, {'no_skill'}),
+            (previous, {'candidate', 'previous'}, {'previous'}),
+            ((*previous, '--baseline'), {'candidate', 'previous', 'no_skill'}, {'previous', 'no_skill'}),
+        ):
+            with self.subTest(options=options):
+                result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock),
+                                       *options, execute=self.execute)
+                self.assertEqual((result[0], result[4]), (3, len(arms)), result)
+                summary = json.loads(result[1])
+                self.assertEqual(set(summary['behavior_summary']), arms)
+                self.assertEqual({item['against'] for item in summary['case_comparisons']}, comparisons)
+                self.assertEqual(summary['decision'], 'inconclusive')
+
+    def test_case_selection_and_explicit_repetitions_do_not_expand_other_cases(self):
+        second = r.load_yaml(self.skill / 'evals/tasks/final.yaml')
+        second['id'] = 'second'
+        r.write_yaml(self.skill / 'evals/tasks/second.yaml', second)
+        r.write_yaml(self.skill / 'evals/eval.yaml', {
+            'name': 'sample', 'version': 3, 'holdout': ['tasks/final.yaml', 'tasks/second.yaml']})
+        self.freeze()
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock),
+                               '--previous-skill', str(self.skill), '--case', 'second',
+                               '--trials', '2', execute=self.execute)
+        self.assertEqual((result[0], result[4]), (3, 4), result)
+        summary = json.loads(result[1])
+        self.assertEqual({item['task'] for item in summary['case_comparisons']}, {'second'})
+        self.assertEqual({item['trial'] for item in summary['case_comparisons']}, {1, 2})
+
+    def test_must_pass_failure_rejects_candidate_and_preserves_independent_arm(self):
+        self.freeze()
+        def execute(**kw):
+            result = self.execute(**kw)
+            if kw['workspace'].parents[1].name == 'candidate':
+                kw['output'].write_text(json.dumps({'deliverable': 'Wrong answer.'}))
+            return result
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock),
+                               '--previous-skill', str(self.skill), execute=execute)
+        self.assertEqual((result[0], result[4]), (1, 2), result)
+        summary = json.loads(result[1])
+        self.assertEqual(summary['decision'], 'reject_candidate')
+        self.assertEqual(summary['behavior_summary']['candidate']['failed'], 1)
+        self.assertEqual(summary['behavior_summary']['previous']['passed'], 1)
+        self.assertEqual(summary['case_comparisons'][0]['critical_regressions'], ['exact'])
+
+    def test_timeout_is_unjudged_even_when_another_arm_passes(self):
+        self.freeze()
+        previous = ('--previous-skill', str(self.skill))
+        for error_arm, options, passed_arm in (
+            ('candidate', previous, 'previous'),
+            ('previous', previous, 'candidate'),
+            ('no_skill', ('--baseline',), 'candidate'),
+        ):
+            with self.subTest(error_arm=error_arm):
+                def execute(**kw):
+                    result = self.execute(**kw)
+                    if kw['workspace'].parents[1].name == error_arm:
+                        result['exit_code'] = 124
+                    return result
+                result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock),
+                                       *options, execute=execute)
+                self.assertEqual((result[0], result[4]), (2, 2), result)
+                summary = json.loads(result[1])
+                self.assertEqual(summary['decision'], 'blocked')
+                self.assertEqual(summary['behavior_summary'][error_arm]['passed'], 0)
+                self.assertEqual(summary['behavior_summary'][error_arm]['errors'], 1)
+                self.assertEqual(summary['behavior_summary'][passed_arm]['passed'], 1)
+                self.assertEqual(summary['case_comparisons'][0]['result'], 'inconclusive')
+
+    def test_changed_runtime_case_fixture_or_grader_blocks_before_cli(self):
+        grader = self.skill / 'evals/graders/check.py'
+        grader.parent.mkdir()
+        grader.write_text('print("original")')
+        self.freeze()
+        for relative in ('SKILL.md', 'evals/eval.yaml', 'evals/tasks/final.yaml',
+                         'evals/fixtures/input/input.txt', 'evals/graders/check.py'):
+            with self.subTest(relative=relative):
+                path = self.skill / relative
+                original = path.read_text()
+                path.write_text(original + '\n# changed\n')
+                result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock))
+                self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+                self.assertIn('frozen input mismatch', result[2])
+                path.write_text(original)
+
+    def test_malformed_or_missing_record_and_in_package_record_fail_closed(self):
+        for contents in (None, '{', '[]', '{"version": 1}'):
+            if contents is not None:
+                self.lock.write_text(contents)
+            result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock))
+            self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+        result = self.run_main('--freeze-inputs', str(self.skill / 'lock.json'))
+        self.assertEqual(result[0], 2, result)
+        self.assertFalse((self.skill / 'lock.json').exists())
+
+    def test_mutated_evaluation_snapshot_is_blocked(self):
+        self.freeze()
+        def mutate(**kw):
+            result = self.execute(**kw)
+            run_dir = kw['workspace'].parents[4]
+            (run_dir / 'evaluation-inputs/fixtures/input/input.txt').write_text('contaminated')
+            return result
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=mutate)
+        self.assertEqual(result[0], 2, result)
+        self.assertIn('contaminated run', result[2])
+
+    def test_old_or_unknown_freeze_format_requires_new_record_before_cli(self):
+        record = json.loads(self.freeze())
+        for version, digest_format in ((1, r.TREE_DIGEST_FORMAT), (3, r.TREE_DIGEST_FORMAT), (2, 'unknown')):
+            self.lock.write_text(json.dumps({**record, 'version': version, 'tree_digest_format': digest_format}))
+            result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock))
+            self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+            self.assertIn('re-freeze with --freeze-inputs to a new path', result[2])
+
+    def test_changed_execute_bit_or_empty_directory_blocks_before_cli(self):
+        source = self.skill / 'evals/fixtures/input/input.txt'
+        source.chmod(0o644)
+        self.freeze()
+        source.chmod(0o755)
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock))
+        self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+        self.assertIn('frozen input mismatch', result[2])
+        source.chmod(0o644)
+        (source.parent / 'empty').mkdir()
+        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock))
+        self.assertEqual((result[0], result[3], result[4]), (2, 0, 0), result)
+        self.assertIn('frozen input mismatch', result[2])
+
+    def setup_importing_grader(self, mutate_source=False):
+        graders = self.skill / 'evals/graders'
+        graders.mkdir()
+        (graders / 'helper.py').write_text('VALUE = 42\n')
+        (graders / 'check.py').write_text(
+            'import os, helper\nfrom pathlib import Path\n'
+            'assert "PYTHONDONTWRITEBYTECODE" not in os.environ\n'
+            'assert helper.VALUE == 42\n'
+            'assert list((Path(__file__).parent / "__pycache__").glob("helper.*.pyc"))\n'
+            + ('Path(helper.__file__).write_text("VALUE = 99\\n")\n' if mutate_source else ''))
+        task_path = self.skill / 'evals/tasks/final.yaml'
+        task = r.load_yaml(task_path)
+        task['requirements'][0]['objective'] = [{'kind': 'command', 'argv': [
+            r.sys.executable, '{eval_root}/graders/check.py']}]
+        r.write_yaml(task_path, task)
+
+    def test_real_grader_import_cache_does_not_contaminate_frozen_inputs(self):
+        self.setup_importing_grader()
+        self.freeze()
+        with mock.patch.dict(os.environ):
+            os.environ.pop('PYTHONDONTWRITEBYTECODE', None)
+            result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=self.execute)
+        self.assertEqual(result[0], 3, result)
+        summary = r.load_yaml(Path(json.loads(result[1])['results_dir']) / 'summary.yaml')
+        self.assertEqual(summary['behavior_summary']['candidate']['passed'], 1)
+
+    def test_real_grader_source_mutation_remains_contamination(self):
+        self.setup_importing_grader(mutate_source=True)
+        self.freeze()
+        with mock.patch.dict(os.environ):
+            os.environ.pop('PYTHONDONTWRITEBYTECODE', None)
+            result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=self.execute)
+        self.assertEqual(result[0], 2, result)
+        self.assertIn('contaminated run', result[2])
+
+    def test_real_runtime_helper_import_cache_is_allowed_but_source_mutation_is_not(self):
+        scripts = self.skill / 'scripts'
+        scripts.mkdir()
+        (scripts / 'helper.py').write_text('VALUE = 42\n')
+        self.freeze()
+        for mutate in (False, True):
+            def execute(**kw):
+                runtime = kw['workspace'].parent / 'runtime-skill/sample/scripts'
+                env = dict(os.environ)
+                env.pop('PYTHONDONTWRITEBYTECODE', None)
+                subprocess.run([r.sys.executable, '-c', 'import helper; assert helper.VALUE == 42'],
+                               cwd=runtime, env=env, check=True, capture_output=True)
+                self.assertTrue(list((runtime / '__pycache__').glob('helper.*.pyc')))
+                if mutate:
+                    (runtime / 'helper.py').write_text('VALUE = 99\n')
+                return self.execute(**kw)
+            result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock), execute=execute)
+            self.assertEqual(result[0], 2 if mutate else 3, result)
+            summary = r.load_yaml(Path(json.loads(result[1])['results_dir']) / 'summary.yaml')
+            if mutate:
+                self.assertIn('staged runtime skill changed', summary['behavior_trials'][0]['output_error'])
+            else:
+                self.assertEqual(summary['behavior_summary']['candidate']['passed'], 1)
 
 if __name__=='__main__': unittest.main()

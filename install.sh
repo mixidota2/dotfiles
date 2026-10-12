@@ -46,6 +46,18 @@ run() {
 
 link_file() {
   source=$1
+  # Existing unmarked skills remain accepted. Never replace an installed skill
+  # with an explicitly marked candidate, including its support files.
+  case "$source" in
+    "$repo_dir"/skills-local/.codex/skills/*/*)
+      skill_relative=${source#"$repo_dir/skills-local/.codex/skills/"}
+      skill_name=${skill_relative%%/*}
+      if [ -e "$repo_dir/skills-local/.codex/skills/$skill_name/.candidate" ] ||
+         [ -L "$repo_dir/skills-local/.codex/skills/$skill_name/.candidate" ]; then
+        return
+      fi
+      ;;
+  esac
   relative=${source#"$repo_dir/"}
   relative=${relative#*/}
   link_path "$source" "$relative"
@@ -131,6 +143,10 @@ done
 # Only directories containing SKILL.md are discoverable skills, not support files.
 for skill_dir in "$repo_dir"/skills-local/.codex/skills/*; do
   [ -f "$skill_dir/SKILL.md" ] || continue
+  if [ -e "$skill_dir/.candidate" ] || [ -L "$skill_dir/.candidate" ]; then
+    printf 'skip candidate  %s\n' "$skill_dir"
+    continue
+  fi
   skill_name=${skill_dir##*/}
   link_path "$skill_dir" ".claude/skills/$skill_name"
 done

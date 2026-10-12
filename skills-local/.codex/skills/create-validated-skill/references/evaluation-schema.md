@@ -58,21 +58,61 @@ selection, invalid output, missing completed trace, and executor errors fail clo
 
 ```sh
 python3 scripts/validate_skill.py /path/to/skill
+# Routine revision: candidate versus previous, scoped to the affected case.
 python3 scripts/run_eval.py /path/to/candidate --engine codex --model MODEL \
-  --baseline --previous-skill /path/to/previous --split validation
+  --previous-skill /path/to/previous --case AFFECTED_CASE
+# New skill: candidate versus no skill.
+python3 scripts/run_eval.py /path/to/candidate --engine codex --model MODEL --baseline
+python3 scripts/run_eval.py /path/to/candidate --freeze-inputs /path/to/experiment/frozen-inputs.json
 python3 scripts/run_eval.py /path/to/candidate --engine claude --model MODEL \
-  --baseline --split holdout --candidate-frozen
+  --baseline --split holdout --frozen-inputs /path/to/experiment/frozen-inputs.json
 ```
 
-Omit `--previous-skill` for new skills. `--baseline` includes no-target-skill;
-revisions automatically include it. `--case ID` narrows cases; `--trials N` repeats
-fresh matched trials. `--binary` selects an existing official CLI. The runner is a
+`--freeze-inputs` creates an exclusive (never overwritten) hash record outside the
+skill package and exits without calling a CLI. It hashes runtime files and eval
+inputs (manifest, cases, fixtures, graders), excluding results, ledger, and evidence.
+Have the independent coordinator keep/commit this record before final evaluation.
+`--frozen-inputs` compares the staged inputs before CLI startup; any mismatch blocks
+the run. The legacy `--candidate-frozen` declaration alone no longer permits holdout.
+Input snapshots are also checked after execution. These checks detect input changes,
+not whether the author previously saw a case or regenerated the record. They do not
+replace separation of author and consumer or an independently retained holdout.
+
+Freeze records now use version 2 and `tree_digest_format: sha256-tree-manifest-v2`.
+Tree hashes use canonical JSON (sorted keys, compact separators, ASCII escaping)
+of entries sorted by relative POSIX path, including the root as `.`. Each entry
+records its path and type; files include a content SHA256 and owner/group/other
+execute bits, and directories include execute bits. Empty directories are included
+because their presence can affect a task. Symlinks record their literal target
+without following it (staged inputs still reject symlinks); special files are rejected.
+As in staging, generated `__pycache__` directories are excluded, including those
+created by normal grader/runtime-helper imports. Within staged snapshots, source
+`.py` changes, new bytecode outside these directories, and same-name files or
+symlinks remain detectable.
+Absolute locations, timestamps, ownership, and read/write permission bits are not
+part of this portable identity. Summaries/ledgers label the tree hash format too;
+scenario/settings hashes retain their existing definitions. Version-1 or unknown
+freeze formats fail before CLI startup, even if digest strings match. Preserve old
+records and run `--freeze-inputs` to a new path; this creates a new freeze event and
+does not retroactively strengthen an earlier experiment's evidence.
+
+`--previous-skill` includes only candidate and previous. `--baseline` explicitly
+adds no-target-skill; combining both options requests three arms. Existing research
+commands that need three arms must specify both flags. With neither flag, only the
+candidate runs: useful for a smoke, not comparative evidence. `--case ID` narrows
+cases (repeat the flag for multiple cases); `--trials N` repeats fresh matched trials.
+The default is one trial per selected case/arm, in sequence; the runner does not
+automatically repeat, resume, or parallelize. Agent invocations equal cases × trials
+× requested arms; each invocation can contain multiple model/API calls. A revision
+with three cases changes from nine to six invocations, not a measured wall-time gain.
+`--binary` selects an existing official CLI. The runner is a
 behavior harness, not a native routing test. `--no-ledger` leaves the source ledger
 unchanged. `--self-test` runs infrastructure checks only, with no model calls.
 
 Exit codes: 1 candidate objective failure; 2 infrastructure/configuration error;
 3 completed but inconclusive experiment. There is intentionally no automatic
 adoption exit code. `--self-test` returns 0 when its infrastructure checks pass.
+`--freeze-inputs` returns 0 when the record is written, not when behavior is validated.
 
 ## Evidence
 
@@ -82,6 +122,12 @@ stderr, external grader output, result YAML, and a summary are retained. Summari
 record agent/CLI/model, split, content hashes, matched case comparisons, duration,
 usage, limitations, and the decision. Default model selection remains explicitly
 unresolved. A hash is reproducibility evidence, not isolation or behavioral proof.
+When supplied, `input_freeze` preserves the prior record in the summary and ledger.
+Its evaluation hash covers source inputs; `evaluation_sha256` additionally covers
+the runner's derived manifest and selected-task snapshots. Legacy `with_skill` and
+current `candidate` failure annotations both feed failure-pattern history; objective
+failures remain observations until a concrete remedy is supplied, never fabricated
+general rules.
 
 ## Ledger paths
 

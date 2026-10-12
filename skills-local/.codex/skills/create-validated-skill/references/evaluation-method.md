@@ -1,85 +1,167 @@
-# Evidence before adoption
+# Intent, evidence, and adoption
 
-## What the evidence says
+## Sources and what they support
 
-SkillsBench 1.1 reports configuration-dependent degradation from self-generated
-skills and mixed task-level effects even for curated skills. Execution-feedback
-optimization can help, but neither a polished instruction nor a self-score proves
-local benefit. These findings concern agent task performance, not model-weight
-deterioration. Useful sources:
+Official practical guidance and empirical findings answer different questions:
 
-- https://www.skillsbench.ai/blogs/skillsbench-1-1
-- https://github.com/microsoft/SkillOpt
-- https://arxiv.org/abs/2609.39148 (held-out generalization)
-- https://arxiv.org/abs/2608.11888 (functional failures and efficiency regressions)
-- https://arxiv.org/abs/2605.24050 (library selection effects)
+- [Anthropic's skill-creator guidance](https://claude.com/resources/articles/improving-skill-creator-test-measure-and-refine-agent-skills)
+  distinguishes capability uplift from encoded preferences. Workflow fidelity is
+  a valid purpose even when the model can already perform the component tasks.
+  Its [creator](https://github.com/anthropics/skills/blob/main/skills/skill-creator/SKILL.md)
+  starts from intent; execution history is one source, not an eligibility condition.
+  It compares new skills against no skill and revisions against the old version,
+  runs independent arms in parallel, and treats blind comparison as optional.
+- [OpenAI's evaluation guide](https://developers.openai.com/blog/eval-skills)
+  separates outcome, process, style, and efficiency checks, starts with focused
+  deterministic checks, and adds heavier checks when they reduce a relevant risk.
+  The [Codex creator](https://github.com/openai/codex/blob/main/codex-rs/skills/src/assets/samples/skill-creator/SKILL.md)
+  also works from intended uses and concrete examples.
+- [SkillLens](https://arxiv.org/html/2605.23899) studies experience extraction and
+  downstream consumption. It finds target-dependent utility and warns that textual
+  plausibility alone does not establish benefit; concrete remedies can be useful.
+  Its trajectory-based experiment is not a requirement for all skill creation.
+- [SkillOpt](https://arxiv.org/abs/2605.23904) motivates bounded edits selected on
+  validation outcomes. We reuse that discipline, not its full optimization system.
+- [Held-out generalization research](https://arxiv.org/html/2609.39148v2) identifies
+  overfitting from turning task-specific details into universal rules and evaluates
+  frozen artifacts on separate tasks. Its results do not guarantee local gains.
+- [Evaluation/evolution survey](https://arxiv.org/html/2606.11435v1) describes gaps
+  across creation, retrieval, task utility, and operational cost. These are distinct
+  evidence needs, not a mandate to reproduce every benchmark.
+- [Dynamic Agent Skills, Yubo Li, v1 (2026-07-11)](https://arxiv.org/html/2607.10113v1)
+  discusses staged admission and the limited observation scope of each verifier:
+  passing a narrow contract does not establish general transfer.
 
-These motivate controls, not a universal numeric adoption threshold.
+Our design inference is to preserve required intent first, ground conditional
+instructions in known inputs, and test both the generated artifact and its use.
+No cited paper proves this repository's creator improves a particular model.
+These sources do not establish a universal trial count or time limit. Our practical
+choice is to scale checks with the change, preserving the user's must-pass intent.
+
+## Draft from intent, experience, or both
+
+Record purpose, scope, must/never behavior, output/evidence, and optional choices
+in a short note or existing task record. Do not require a new schema or file. For
+example, if the user requires inspecting tests before a patch and reporting the
+command/result afterward, those steps are correctness requirements. The choice of
+search command or note layout is usually optional unless explicitly prescribed.
+
+Turn requirements and reliable specifications into conditional executable steps.
+When history exists, inspect successful actions as well as failures, locate the
+first consequential error, and propose a bounded remedy. Without history, state
+which expected benefit is a hypothesis and design a case that could refute it.
+Do not manufacture logs, infer universal rules from a single failure, or reject a
+candidate simply because only intent and expert knowledge are available.
+
+Keep checks anchored to the original request/specification rather than regenerating
+them from each candidate. Required behavior cannot be traded away for speed. If
+requirements themselves change, record the user-directed change separately. A
+checklist mention is not proof of execution; inspect the result or action evidence.
 
 ## Candidate, experiment, decision
 
-Keep creation, evaluation, and adoption separate. Before editing, record the user
-problem, existing mechanism, previous accepted version, intended improvement,
-critical constraints, expected efficiency cost, and edit budget. Preserve the
-one-shot version if studying optimization, rather than replacing its evidence.
+Create candidates outside discoverable roots (for example `skill-candidates/` at
+repository root). `init_skill.py` refuses known `.codex/skills`, `.claude/skills`,
+`.agents/skills`, and `.pi/agent/skills` paths, including resolved symlink targets,
+and adds a zero-content `.candidate` marker. The installer skips marked packages
+for both Codex and Claude and never removes an existing installation on that basis.
+Unmarked existing packages remain installable; there is no retroactive registry.
 
-Use matched no-target-skill/candidate arms for new skills. Add the previous
-accepted version for revisions. Every release case must have the comparison arms
-needed for the claim. Pin model and match prompts, fixtures, tools, limits,
-permissions, and settings. Counterbalance order across repeated trials. A single
-trial is a smoke test; increase repetitions only for meaningful variability or
-risk. Do not substitute a favorable aggregate for case-level regressions.
+For revisions, use a separate copy or checkout and mark the candidate there. Do
+not edit through a live installed symlink: skipping installation cannot undo such
+an edit. A marker is an installer safeguard, not a native discovery control or
+revocation mechanism. Keep candidates outside discovery roots even when marked.
+After a documented adoption decision, remove the marker and move/copy the reviewed
+version into `skills-local/.codex/skills` in a reviewed change. Installation is a
+separate authorized action. Reject/blocked/inconclusive candidates stay isolated.
+Do not mark all existing skills or uninstall accepted versions as a migration.
 
-## Separate data by purpose
+Use matched candidate/no-target-skill arms for new skills and candidate/accepted
+version for revisions. Add no-target-skill to a revision only when needed for the
+claim, such as continued value over the base agent or studying the creation method.
+Pin model and match inputs, tools, permissions, limits, and settings. Preserve the
+initial draft if studying optimization. Repeat only where variability or risk matters.
+Do not substitute a favorable aggregate for a case-level regression.
 
-- Development cases may inform edits.
-- Validation cases select among candidates.
-- Final held-out cases are opened after a candidate is selected and frozen.
+## Choose checks proportional to the change
 
-Vary task families, names, paths, schemas, constraints, and legitimate solutions.
-Once a final case informs an edit, mark it as development/regression data and
-obtain a fresh final case. Do not quietly relabel reused tests as held out.
+- Every change gets cheap structure checks and relevant script tests. If the diff
+  preserves intent, triggers, required/prohibited behavior, and output, record that
+  reason for omitting behavior runs. Wording that changes meaning is behavioral.
+- Behavior changes start with fresh-consumer smoke covering the changed requirements
+  and critical existing behavior. Use deterministic grading where sufficient; add
+  independent qualitative review only for properties those checks cannot establish.
+- New capabilities, major revisions, high-risk actions, model/tool changes, or smoke
+  disagreement warrant broader cases and comparisons. Native routing is separately
+  tested when triggers/discovery change or a known routing interaction needs checking.
 
-The runner stages runtime skill files without evals/history, and fixtures without
-graders. This prevents accidental disclosure, not malicious filesystem access.
-It retains the existing authenticated agent context, which can discover global
-skills. Therefore its built-in decision stays inconclusive unless it finds a
-candidate defect or infrastructure blocker. It never claims airtight no-skill
-isolation or automatically installs a candidate. Use an independently verified
-environment and record its boundaries when stronger causal claims are needed.
+Reuse cases and checks whose assumptions remain valid; do not rerun unaffected
+suites without a reason. Record what ran, coverage, omissions and why, remaining
+uncertainty, and the adoption scope in existing notes/records. Must-pass failure
+stops promotion, not the honest recording of other authorized independent checks.
+An interrupted or budget-limited experiment leaves missing evidence unjudged.
+Infrastructure failure is blocked; insufficient evidence is inconclusive. Neither
+justifies adoption, automatic retry until green, or removing a required procedure.
 
-## Measure actual outcomes
+## Author-to-consumer test and data separation
 
-Use external deterministic tests for artifact existence, exact values, executable
-behavior, invariants, and protected contracts. Test graders against a known-good
-artifact and deliberate bad artifacts. Broad keyword checks are smoke assertions,
-not proof of design quality. Check final files, not prose promising to write them.
+Development may inform edits; validation selects among candidates; final unseen
+cases test the selected frozen artifact. Vary inputs, names, paths, schemas, and
+legitimate solutions. Once a final case informs an edit, retain it as regression
+data and obtain a fresh final case. Do not relabel reused tests as unseen.
+For a single uniterated candidate, an untouched targeted smoke case can be the scoped
+final check after freezing. Do not manufacture three suites for every minor revision;
+use separate selection data when actually choosing among candidates. A small pass
+establishes only the checked behavior, not statistical superiority.
 
-Narrative outcomes can require independent qualitative review with a fixed rubric.
-Blind reviewers to candidate identity where feasible. Preserve disagreements;
-LLM-only ratings and self-reported success do not count as adoption evidence. V2
-semantic/text suites remain readable but require review; the new runner does not
-silently convert their old ratings into objective results.
+When evaluating a claim about the effectiveness of the creation method itself,
+compare the relevant creators (for example, old and candidate) on the same creation
+brief. Save their generated runtime packages and exact commits/hashes. Fresh consumers
+then solve the same unseen downstream tasks with those artifacts. Choose comparison
+arms for the question; add a no-target-skill baseline only when the claim needs it,
+not as an implicit third condition. Consumers get task inputs and their assigned
+runtime skill, without the author's conversation, training logs, expected answers,
+or grader. A generator
+producing a good-looking SKILL.md is only the first stage. The consumer's observable
+behavior and actual output establish whether that skill works. An independent
+coordinator should retain the original requirement checks and unseen fixtures.
+This creation-method experiment is not a mandatory second pipeline for routine
+skill maintenance. Existing results remain tied to their exact authoring commit;
+later authoring changes require their own scoped evidence.
 
-## Routing is separate
+`run_eval.py --freeze-inputs` records candidate/evaluation hashes without a model
+call. Holdout requires `--frozen-inputs`; mismatches stop before CLI startup. Keep
+that record in a separate committed artifact or with the coordinator. Hashes detect
+input drift but cannot prove chronology, hiddenness, or author independence. The
+runner stages runtime files without evals/history and fixtures without graders;
+this is data hygiene, not filesystem isolation. Global skills can still contaminate
+arms, so automatic adoption remains disabled. Independent cloud tasks are suitable
+when a nested CLI cannot start; never change authentication/security to force it.
 
-Behavior trials explicitly load the candidate. Native discovery trials must not
-mention its name/path in the user request. Test positive, negative, near-miss,
-and plausible sibling competition in the actual engine. Record availability,
-observed successful read, and correct application separately. A read is not
-compliance; a missing trace observation is not proof of non-use. Tiny routing
-samples are smoke evidence, not stable population rates.
+The runner supports case selection and separate result records, but has no automatic
+resume, result cache, or parallel scheduler. Use `--case` for scoped runs; a rerun
+creates new evidence rather than resuming or overwriting a previous trial. Independent
+cloud tasks can run in parallel when supported, with separate workspaces and matched
+settings. Do not parallelize edits with their dependent validation or interpret lower
+wall time as fewer model calls. Distinguish local check time, agent invocations/API
+usage, and end-to-end time including environment startup and artifact transfer.
 
-## Decision and report
+## Measure and report the claim actually tested
 
-A predeclared adoption rule should require no critical regression, demonstrated
-benefit on held-out outcomes, acceptable guardrails, and bounded overhead. An
-equal mean can be justified by measured repeatability/error-prevention, never by
-an unsupported narrative. Ties with extra work usually justify simplification.
+Use external deterministic checks for exact values, files, executable behavior,
+invariants, and protected contracts. Exercise graders with known-good and deliberately
+wrong artifacts. Use independent review for semantic/process fidelity that cannot
+be checked mechanically; LLM preference or self-reported success alone is insufficient.
+V2 qualitative suites remain readable, not silently converted into objective passes.
+Native routing needs separate positive, negative, near-miss, and sibling cases with
+no explicit skill name/path. Distinguish availability, observed read, and compliance.
 
-Report retain/promote, reject, inconclusive, or blocked with reasons. Infrastructure
-errors are not skill-quality failures and may not be silently discarded. Preserve
-failed candidates, raw events, commands, versions, hashes, costs, and the cases
-that disagree. Separate package-compatible, adapter-unit-tested, and behaviorally
-validated labels per agent. Do not claim repository-wide improvement from one
-small successful fixture.
+First report required/prohibited behavior, then quality and efficiency of compliant
+results. Preference fidelity can justify retention at tied capability scores;
+remove only optional overhead. A performance-gain claim needs matched downstream
+evidence and uncertainty appropriate to the sample, beyond merely meeting checks.
+A few representative cases support scoped acceptance, not statistical superiority.
+Report wins/losses/ties, critical regressions, costs, missing observations, and the
+adoption decision. Preserve failures and historical ledgers. Infrastructure errors
+are blocked/unrun, not skill-quality failures. Package compatibility, adapter unit
+tests, native routing, and real model validation remain separate per engine.

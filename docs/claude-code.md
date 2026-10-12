@@ -26,7 +26,7 @@ MCP servers, or global `CLAUDE.md` are installed by this repository.
 The six directories in `skills-local/.codex/skills` are the shared source of truth.
 The installer links each directory separately into `~/.claude/skills`, a
 [personal skill location supported by Claude Code](https://code.claude.com/docs/en/skills).
-Individual directory symlinks are supported. New local skill directories with a
+Individual directory symlinks are supported. Unmarked local skill directories with a
 `SKILL.md` are picked up when you rerun `./install.sh`; edits to existing linked
 skills follow the checkout immediately. Keep the checkout at a stable location,
 or rerun the installer after moving it.
