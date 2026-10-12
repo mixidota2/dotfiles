@@ -397,20 +397,27 @@ class FrozenInputTests(unittest.TestCase):
 
     def test_timeout_is_unjudged_even_when_another_arm_passes(self):
         self.freeze()
-        def execute(**kw):
-            result = self.execute(**kw)
-            if kw['workspace'].parents[1].name == 'candidate':
-                result['exit_code'] = 124
-            return result
-        result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock),
-                               '--previous-skill', str(self.skill), execute=execute)
-        self.assertEqual((result[0], result[4]), (2, 2), result)
-        summary = json.loads(result[1])
-        self.assertEqual(summary['decision'], 'blocked')
-        self.assertEqual(summary['behavior_summary']['candidate']['passed'], 0)
-        self.assertEqual(summary['behavior_summary']['candidate']['errors'], 1)
-        self.assertEqual(summary['behavior_summary']['previous']['passed'], 1)
-        self.assertEqual(summary['case_comparisons'][0]['result'], 'inconclusive')
+        previous = ('--previous-skill', str(self.skill))
+        for error_arm, options, passed_arm in (
+            ('candidate', previous, 'previous'),
+            ('previous', previous, 'candidate'),
+            ('no_skill', ('--baseline',), 'candidate'),
+        ):
+            with self.subTest(error_arm=error_arm):
+                def execute(**kw):
+                    result = self.execute(**kw)
+                    if kw['workspace'].parents[1].name == error_arm:
+                        result['exit_code'] = 124
+                    return result
+                result = self.run_main('--split', 'holdout', '--frozen-inputs', str(self.lock),
+                                       *options, execute=execute)
+                self.assertEqual((result[0], result[4]), (2, 2), result)
+                summary = json.loads(result[1])
+                self.assertEqual(summary['decision'], 'blocked')
+                self.assertEqual(summary['behavior_summary'][error_arm]['passed'], 0)
+                self.assertEqual(summary['behavior_summary'][error_arm]['errors'], 1)
+                self.assertEqual(summary['behavior_summary'][passed_arm]['passed'], 1)
+                self.assertEqual(summary['case_comparisons'][0]['result'], 'inconclusive')
 
     def test_changed_runtime_case_fixture_or_grader_blocks_before_cli(self):
         grader = self.skill / 'evals/graders/check.py'
