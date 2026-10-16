@@ -102,6 +102,8 @@ class InstallerPortabilityTests(unittest.TestCase):
         }
         expected[str(self.home / ".pi/agent/skills")] = str(self.home / ".codex/skills")
         expected[str(self.home / ".claude/skills/new-skill")] = str(self.repo / "skills-local/.codex/skills/new-skill")
+        expected[str(self.home / ".claude/AGENTS.md")] = str(self.repo / "codex/.codex/AGENTS.md")
+        expected[str(self.home / ".claude/AGENTS.md")] = str(self.repo / "codex/.codex/AGENTS.md")
         preview = self.install("--dry-run")
         self.assertEqual(preview.returncode, 0, preview.stderr)
         planned = [line for line in preview.stdout.splitlines() if line.startswith("link    ")]

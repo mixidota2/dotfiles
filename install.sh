@@ -151,6 +151,32 @@ for skill_dir in "$repo_dir"/skills-local/.codex/skills/*; do
   link_path "$skill_dir" ".claude/skills/$skill_name"
 done
 
+# Claude Code reads .claude/AGENTS.md in the working directory and its parents
+# when no CLAUDE.md is there, so this applies the global instructions to work
+# under HOME. Claude Code has no user-level AGENTS.md location of its own.
+link_path "$repo_dir/codex/.codex/AGENTS.md" ".claude/AGENTS.md"
+
+# ~/.claude/settings.json also holds settings written by Claude Code and other
+# apps (such as Orca's hooks), so only the keys this repository manages are
+# merged into it instead of linking the file.
+merge_claude_settings() {
+  additions=$repo_dir/claude/settings-additions.json
+  target=$HOME/.claude/settings.json
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'skip    %s (python3 not found; add the keys in %s yourself)\n' "$target" "$additions" >&2
+    return
+  fi
+  # -B: macOS's python3 otherwise writes bytecode caches under ~/Library.
+  if [ "$dry_run" = true ]; then
+    python3 -B "$repo_dir/claude/merge_settings.py" "$additions" "$target" --check || :
+    return
+  fi
+  mkdir -p "$(dirname "$target")"
+  # A settings file that cannot be read is left as it is; linking still completes.
+  python3 -B "$repo_dir/claude/merge_settings.py" "$additions" "$target" || :
+}
+merge_claude_settings
+
 # Pi and Codex share one skill installation.
 pi_skills=$HOME/.pi/agent/skills
 codex_skills=$HOME/.codex/skills
