@@ -1,6 +1,6 @@
 ---
 name: design-python-code
-description: Pythonコードのpackage・module・class・functionの配置と責務、依存方向、公開API、domain model、外部依存境界を設計・実装・レビューする。Pythonプロジェクトのディレクトリ構成を決める、package直下に増えた.pyを再編する、巨大なservices.py/models.py/utils.pyを分割する、新機能の配置を決める、SRP・OCP・凝集度・結合度・変更局所性を改善する、Protocol・port/adapter・Strategy等の抽象化要否を判断する依頼で使う。単純な構文・bug修正、format/lint、依存library利用、設計済み依存ruleの機械的設定、patternの概念説明だけ、複数system・teamの合意用Design Doc作成では使わない。
+description: Pythonのコードを書く・変える前に、package・module・class・function・data modelの置き場所と責務、依存方向、公開API、外部依存境界を決める（設計・実装・レビュー）。新しいPythonアプリ・package・moduleを作るとき、「〜できるようにして」「〜して欲しい」等の機能追加・変更で、新しいclass・function・data model・状態を足す、既存moduleへロジックや判断を追加する、責務や状態の置き場所が変わるときは、依頼文に設計・配置・分割等の語がなくても、最初のコード編集の前に使う。package構成の決定・再編、巨大moduleの分割、SRP・凝集度・結合度・変更局所性の改善、Protocol・port/adapter等の抽象化要否の判断、Pythonの設計レビューにも使う。置き場所が変わらない数行の局所的なbug・構文修正、定数・設定値の変更だけ、typo、format/lint、依存libraryの導入や使い方、patternの概念説明だけ、設計済み依存ruleの機械的設定、複数system・teamの合意用Design Doc作成では使わない。
 ---
 
 # Pythonコードを設計する

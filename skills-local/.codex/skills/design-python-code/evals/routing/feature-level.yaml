@@ -1,0 +1,28 @@
+kind: feature-level
+# 実際に呼ばれなかった依頼 (kiku の作成・機能追加, 2026-10-15〜16) と同じ言い方の例。
+# 期待値はケースごとに expected_activation で示す
+cases:
+  - id: feat-subtopic-slides
+    critical: true
+    expected_activation: true
+    prompt: kikuについて。今はテーマごとのスライドがどんどん書き換わって、最終的にテーマごとに1枚しか残らない。テーマの中でサブテーマが変わったときは上書きじゃなくて、それぞれ別のスライドとして残して欲しい。
+  - id: feat-system-audio
+    critical: true
+    expected_activation: true
+    prompt: kikuについて、PCの出力音声も対象にできない？ 例えばTeamsで会議してる時にも使いたい感じ。
+  - id: feat-glossary-diff
+    critical: false
+    expected_activation: true
+    prompt: kikuの見直しで、用語集を毎回全部返させてるけど、出力トークンがもったいないので差分だけ返させるようにして。
+  - id: new-python-app
+    critical: true
+    expected_activation: true
+    prompt: PDFを読み込んで内容について質問できるチャットアプリをPythonで作りたい。apps/pdf-chat に作って。
+  - id: change-constant
+    critical: false
+    expected_activation: false
+    prompt: kikuのスライド更新間隔を15秒から25秒にして。
+  - id: small-bug
+    critical: false
+    expected_activation: false
+    prompt: kikuで、スライドが1枚もないまま会議を終えると summarize で IndexError になる。直して。
