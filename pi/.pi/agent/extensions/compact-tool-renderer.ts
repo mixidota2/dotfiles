@@ -82,6 +82,42 @@ function workingMessageForTool(toolName: string, args: any): string {
 	return `${toolName}…`;
 }
 
+function formatToolSummary(toolName: string, args: any): string {
+	if (toolName === "read" || toolName === "edit" || toolName === "write") {
+		const target = shortenPath(args?.path);
+		const range = toolName === "read" && (args?.offset || args?.limit)
+			? `:${args?.offset ?? 1}${args?.limit ? `+${args.limit}` : ""}`
+			: "";
+		return `${toolName} ${target}${range}`;
+	}
+	if (toolName === "bash" || toolName === "powershell") {
+		return `$ ${summarizeCommand(args?.command)}`;
+	}
+	const target = args?.query ?? args?.url ?? args?.pattern ?? args?.path ?? "";
+	return target ? `${toolName} ${summarizeCommand(target)}` : toolName;
+}
+
+const QUIET_TOOLS = new Set([
+	"read",
+	"edit",
+	"write",
+	"bash",
+	"powershell",
+	"grep",
+	"find",
+	"ls",
+	"web_search",
+	"web_fetch",
+	"codemode",
+	"lens_diagnostics",
+	"symbol_search",
+	"project_report",
+	"module_report",
+	"read_symbol",
+	"read_enclosing",
+	"effective_config",
+]);
+
 export default function compactToolRenderer(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", async (event) => {
 		const guidelines = event.systemPromptOptions.promptGuidelines;
@@ -104,83 +140,37 @@ export default function compactToolRenderer(pi: ExtensionAPI): void {
 
 	pi.registerToolRenderer((toolName, next) => {
 		const base = next();
+		if (!QUIET_TOOLS.has(toolName)) {
+			return base;
+		}
 
-		if (toolName === "bash" || toolName === "powershell") {
-			return {
-				renderShell: base?.renderShell ?? "default",
-				renderCall(args: any, theme: any, context: ToolRenderContext) {
-					if (context.expanded && base?.renderCall) {
-						return base.renderCall(args, theme, context);
-					}
-					const cmd = summarizeCommand(args?.command);
+		return {
+			renderShell: "self",
+			renderCall(args: any, theme: any, context: ToolRenderContext) {
+				if (context.expanded) {
+					if (base?.renderCall) return base.renderCall(args, theme, context);
 					return new Text(
-						`${theme.fg("toolTitle", theme.bold("$ "))}${theme.fg("accent", cmd)}${renderStatusBadge(theme, context)}`,
+						`${theme.fg("toolTitle", theme.bold(formatToolSummary(toolName, args)))}${renderStatusBadge(theme, context)}`,
 						0,
 						0,
 					);
-				},
-				renderResult(result: any, options: ToolRenderResultOptions, theme: any, context: ToolRenderContext) {
-					if (options.expanded) {
-						if (base?.renderResult) return base.renderResult(result, options, theme, context);
-						return new Text(theme.fg("toolOutput", extractText(result)), 0, 0);
-					}
-					return renderErrorPreview(result, options, theme, context);
-				},
-			};
-		}
-
-		if (toolName === "read" || toolName === "edit" || toolName === "write") {
-			return {
-				renderShell: base?.renderShell ?? "default",
-				renderCall(args: any, theme: any, context: ToolRenderContext) {
-					if (context.expanded && base?.renderCall) {
-						return base.renderCall(args, theme, context);
-					}
-					const target = shortenPath(args?.path);
-					const range = toolName === "read" && (args?.offset || args?.limit)
-						? theme.fg("muted", `:${args?.offset ?? 1}${args?.limit ? `+${args.limit}` : ""}`)
-						: "";
+				}
+				if (context.isError) {
 					return new Text(
-						`${theme.fg("toolTitle", theme.bold(`${toolName} `))}${theme.fg("accent", target)}${range}${renderStatusBadge(theme, context)}`,
+						`${theme.fg("error", "✗ ")}${theme.fg("toolTitle", theme.bold(formatToolSummary(toolName, args)))}${theme.fg("muted", formatDuration(context.durationMs))}`,
 						0,
 						0,
 					);
-				},
-				renderResult(result: any, options: ToolRenderResultOptions, theme: any, context: ToolRenderContext) {
-					if (options.expanded) {
-						if (base?.renderResult) return base.renderResult(result, options, theme, context);
-						return new Text(theme.fg("toolOutput", extractText(result)), 0, 0);
-					}
-					return renderErrorPreview(result, options, theme, context);
-				},
-			};
-		}
-
-		if (toolName === "grep" || toolName === "find" || toolName === "ls" || toolName === "web_search" || toolName === "web_fetch") {
-			return {
-				renderShell: base?.renderShell ?? "default",
-				renderCall(args: any, theme: any, context: ToolRenderContext) {
-					if (context.expanded && base?.renderCall) {
-						return base.renderCall(args, theme, context);
-					}
-					const label = args?.query ?? args?.url ?? args?.pattern ?? args?.path ?? "";
-					const summary = summarizeCommand(label);
-					return new Text(
-						`${theme.fg("toolTitle", theme.bold(`${toolName} `))}${theme.fg("accent", summary)}${renderStatusBadge(theme, context)}`,
-						0,
-						0,
-					);
-				},
-				renderResult(result: any, options: ToolRenderResultOptions, theme: any, context: ToolRenderContext) {
-					if (options.expanded) {
-						if (base?.renderResult) return base.renderResult(result, options, theme, context);
-						return new Text(theme.fg("toolOutput", extractText(result)), 0, 0);
-					}
-					return renderErrorPreview(result, options, theme, context);
-				},
-			};
-		}
-
-		return base;
+				}
+				return new Text("", 0, 0);
+			},
+			renderResult(result: any, options: ToolRenderResultOptions, theme: any, context: ToolRenderContext) {
+				if (options.expanded) {
+					if (base?.renderResult) return base.renderResult(result, options, theme, context);
+					return new Text(theme.fg("toolOutput", extractText(result)), 0, 0);
+				}
+				return renderErrorPreview(result, options, theme, context);
+			},
+		};
 	});
 }
