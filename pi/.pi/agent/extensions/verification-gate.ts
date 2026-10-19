@@ -93,18 +93,34 @@ export default function verificationGate(pi: ExtensionAPI): void {
 		if (!event.isError && isMutatingCommand(command)) markMutation(`bash: ${shortCommand(command)}`, ctx);
 	});
 
-	pi.on("agent_end", async (_event, ctx) => {
+	pi.on("agent_before_settle", async (event, ctx) => {
 		updateStatus(ctx);
+		if (event.outcome !== "completed" || !event.context.canContinue) return;
 		if (!state.dirty || state.waiver || isFreshPass(state)) return;
 		if (state.remindedVersion === state.mutationVersion || state.reminderCount >= MAX_AUTOMATIC_REMINDERS) {
-			if (ctx.hasUI) ctx.ui.notify(statusText(state), "warning");
 			return;
 		}
 
 		state.remindedVersion = state.mutationVersion;
 		state.reminderCount += 1;
-		pi.sendUserMessage(buildVerificationReminder(state), { deliverAs: "followUp" });
-		if (ctx.hasUI) ctx.ui.notify("変更後の検証証跡がないため、検証ターンを追加しました。", "warning");
+		if (ctx.hasUI) {
+			ctx.ui.setStatus("verification-gate", "… auto-verifying changes");
+		}
+		return {
+			entries: [
+				{
+					type: "custom_message" as const,
+					customType: "verification-gate",
+					content: buildVerificationReminder(state),
+					display: false,
+				},
+			],
+			continue: true,
+		};
+	});
+
+	pi.on("agent_end", async (_event, ctx) => {
+		updateStatus(ctx);
 	});
 
 	pi.registerCommand("verify", {
@@ -168,7 +184,14 @@ function isVerificationCommand(command: string): boolean {
 }
 
 function isMutatingCommand(command: string): boolean {
-	const normalized = command.replace(/\\\n/g, " ").replace(/\s+/g, " ").trim();
+	const normalized = command
+		.replace(/\\\n/g, " ")
+		// Strip benign fd redirects like 2>/dev/null, >/dev/null, 2>&1, and JS arrow functions (=>)
+		.replace(/\b\d*>\s*\/dev\/null\b/g, " ")
+		.replace(/\b\d+>&\d+\b/g, " ")
+		.replace(/=>/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
 	if (!normalized) return false;
 	return MUTATION_PATTERNS.some((pattern) => pattern.test(normalized));
 }
@@ -179,11 +202,12 @@ function shortCommand(command: string): string {
 }
 
 const VERIFICATION_PATTERNS: RegExp[] = [
-	/(?:^|[;&|]\s*)(?:uv run\s+)?(?:python(?:3)?\s+-m\s+)?pytest\b/i,
+	/(?:^|[;&|]\s*)(?:uv run\s+(?:--\S+(?:\s+\S+)?\s+)*)?(?:python(?:3)?\s+(?:-[A-Za-z]+\s+)*-m\s+)?(?:pytest|unittest)\b/i,
 	/(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|check|lint|typecheck|build)\b/i,
 	/(?:^|[;&|]\s*)npx\s+(?:vitest|jest|tsc|eslint|biome)\b/i,
 	/(?:^|[;&|]\s*)(?:vitest|jest|eslint|ruff\s+check|mypy|pyright)\b/i,
 	/(?:^|[;&|]\s*)node\s+--test\b/i,
+	/(?:^|[;&|]\s*)(?:\/bin\/)?(?:sh|bash|zsh)\s+-n\b/i,
 	/(?:^|[;&|]\s*)(?:cargo\s+(?:test|check|clippy)|go\s+(?:test|vet)|mix\s+(?:test|compile|format\s+--check-formatted))\b/i,
 	/(?:^|[;&|]\s*)(?:bundle\s+exec\s+rspec|rspec|rake\s+test|mvn\s+(?:test|verify)|gradle\w*\s+(?:test|check))\b/i,
 	/(?:^|[;&|]\s*)(?:make\s+(?:test|check|lint)|deno\s+(?:test|check|lint)|swift\s+test|xcodebuild\b[^;&|]*\btest)\b/i,
@@ -194,8 +218,8 @@ const MUTATION_PATTERNS: RegExp[] = [
 	/(?:^|[;&|]\s*)(?:apply_patch|sed\s+-i|perl\s+-pi|patch\s+-p\d*|tee\s+\S+|touch\s+|mkdir\s+|cp\s+|mv\s+|rm\s+)/i,
 	/(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:install|add|remove|uninstall)\b/i,
 	/(?:^|[;&|]\s*)(?:uv\s+add|pip\s+install|cargo\s+add|go\s+get|mix\s+deps\.)\b/i,
-	/(?:^|[;&|]\s*)git\s+(?:add|commit|merge|rebase|cherry-pick|apply|restore|checkout|switch)\b/i,
-	/(?:^|[^>])(?:>>|>)\s*[^&|]/,
+	/(?:^|[;&|]\s*)git\s+(?:merge|rebase|cherry-pick|apply|restore|checkout|switch)\b/i,
+	/(?:^|[^>=])(?:>>|>)\s*[^&|\s]/,
 ];
 
 export const __test = { isVerificationCommand, isMutatingCommand };
