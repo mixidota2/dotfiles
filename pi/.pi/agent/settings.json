@@ -1,9 +1,22 @@
 {
   "theme": "dark",
-  "defaultProvider": "openai-codex",
-  "defaultModel": "gpt-5.5",
+  "defaultProvider": "google-vertex",
+  "defaultModel": "gemini-4-argon",
   "defaultThinkingLevel": "medium",
-  "packages": [],
-  "hideThinkingBlock": true
+  "defaultTools": [
+    "+codemode"
+  ],
+  "packages": [
+    "npm:pi-subagents",
+    "npm:@juicesharp/rpiv-ask-user-question",
+    "npm:pi-goal-x",
+    "npm:@gotgenes/pi-permission-system",
+    "npm:pi-powerline-footer",
+    "npm:pi-lens",
+    "npm:@narumitw/pi-plan-mode"
+  ],
+  "hideThinkingBlock": true,
+  "modelThinkingLevels": {
+    "google-vertex/gemini-4-argon": "medium"
+  }
 }
-

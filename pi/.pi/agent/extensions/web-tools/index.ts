@@ -1,17 +1,14 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { lookup } from "node:dns/promises";
-import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import net from "node:net";
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
 import TurndownService from "turndown";
 
 const DEFAULT_USER_AGENT = process.env.PI_WEB_TOOLS_USER_AGENT ?? "pi-local-web-tools/1.0";
-const SEARCH_TIMEOUT_MS = Number(process.env.PI_WEB_SEARCH_TIMEOUT_MS ?? 240_000);
+const SEARCH_TIMEOUT_MS = Number(process.env.PI_WEB_SEARCH_TIMEOUT_MS ?? 60_000);
+const DEFAULT_SEARCH_MODEL = process.env.PI_WEB_SEARCH_MODEL ?? "gemini-2.5-flash";
 const FETCH_TIMEOUT_MS = Number(process.env.PI_WEB_FETCH_TIMEOUT_MS ?? 25_000);
 const MAX_RESPONSE_BYTES = Number(process.env.PI_WEB_FETCH_MAX_BYTES ?? 2_000_000);
 const MAX_FETCH_CHARS = 30_000;
@@ -57,16 +54,16 @@ export default function localWebTools(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "web_search",
 		label: "Web Search",
-		description: "Search the web by delegating to `codex exec --ignore-user-config`, avoiding local search servers and Codex MCP startup/auth.",
-		promptSnippet: "Search the web using Codex exec and return source URLs with snippets",
+		description: "Search the web using Google Vertex AI Grounding with Google Search and return source URLs with snippets.",
+		promptSnippet: "Search the web using Vertex AI Google Search grounding and return source URLs with snippets",
 		promptGuidelines: [
 			"Use web_search when current or external web information is needed; cite result URLs in the answer when using them.",
 			"Use web_fetch after web_search when the content of a specific result page is needed.",
 		],
 		parameters: SEARCH_PARAMS,
-		async execute(_toolCallId, params: WebSearchParams, signal) {
+		async execute(_toolCallId, params: WebSearchParams, signal, _onUpdate, ctx) {
 			try {
-				const data = await runCodexSearch(params, signal);
+				const data = await runVertexSearch(params, ctx, signal);
 				const results = (Array.isArray(data.results) ? data.results : [])
 					.slice(0, Math.min(params.max_results ?? 5, MAX_SEARCH_RESULTS))
 					.map(normalizeSearchResult);
@@ -75,14 +72,15 @@ export default function localWebTools(pi: ExtensionAPI) {
 					content: [{ type: "text" as const, text: formatSearchResults(params.query, results, summary) }],
 					details: {
 						query: params.query,
-						provider: "codex-exec",
+						provider: data.provider,
+						model: data.model,
 						resultCount: results.length,
 						results,
 						summary,
 					},
 				};
 			} catch (error) {
-				return errorResult(`web_search failed: ${errorMessage(error)}`, { query: params.query, provider: "codex-exec" });
+				return errorResult(`web_search failed: ${errorMessage(error)}`, { query: params.query, provider: "google-vertex" });
 			}
 		},
 	});
@@ -325,121 +323,166 @@ function decodeHtml(input: string): string {
 		.replace(/&#(\d+);/g, (_m, dec) => String.fromCodePoint(Number.parseInt(dec, 10)));
 }
 
-async function runCodexSearch(params: WebSearchParams, signal?: AbortSignal): Promise<{ summary?: string; results?: unknown[] }> {
-	const dir = await mkdtemp(join(tmpdir(), "pi-web-search-"));
-	const outputPath = join(dir, "last-message.txt");
+function selectSearchModel(ctx: ExtensionContext): any {
+	const registry = ctx?.modelRegistry;
+	if (!registry) throw new Error("Model registry is not available in extension context");
+
+	const candidates = [
+		registry.find("google-vertex", DEFAULT_SEARCH_MODEL),
+		ctx.model?.provider === "google-vertex" || ctx.model?.provider === "google-generative-ai" ? ctx.model : undefined,
+		registry.find("google-vertex", "gemini-2.5-flash"),
+		registry.find("google-vertex", "gemini-3-flash-preview"),
+		registry.find("google-vertex", "gemini-4-argon"),
+	];
+	const model = candidates.find(Boolean);
+	if (!model) {
+		throw new Error("No google-vertex model found in Pi model registry");
+	}
+	return model;
+}
+
+async function resolveGroundingRedirectUrl(url: string, signal?: AbortSignal): Promise<string> {
+	if (!url.startsWith("https://vertexaisearch.cloud.google.com/grounding-api-redirect/")) {
+		return url;
+	}
+	const timeoutSignal = AbortSignal.timeout(5_000);
+	const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+	try {
+		const res = await fetch(url, { method: "HEAD", redirect: "manual", signal: combinedSignal });
+		const location = res.headers.get("location");
+		if (location) return new URL(location, url).toString();
+	} catch {
+		// Fall back to the grounding redirect URL if resolution times out or fails.
+	}
+	return url;
+}
+
+async function runVertexSearch(
+	params: WebSearchParams,
+	ctx: ExtensionContext,
+	signal?: AbortSignal,
+): Promise<{ provider: string; model: string; summary?: string; results?: unknown[] }> {
+	const model = selectSearchModel(ctx);
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	if (!auth.ok) {
+		throw new Error(auth.error || `Failed to resolve credentials for ${model.provider}/${model.id}`);
+	}
+
 	const maxResults = Math.min(params.max_results ?? 5, MAX_SEARCH_RESULTS);
 	const prompt = [
-		"Search the web for the user's query and return JSON only. Do not include markdown fences.",
-		"Schema:",
-		'{"summary":"brief answer or findings","results":[{"title":"source title","url":"https://...","content":"short snippet explaining relevance","publishedDate":"optional"}]}',
-		`Return at most ${maxResults} results. Prefer authoritative sources and include exact URLs.`,
+		"Search the web for the query below and provide a concise, factual summary of the findings.",
 		params.language ? `Preferred language/locale: ${params.language}` : undefined,
-		params.time_range ? `Prefer sources from the past ${params.time_range}.` : undefined,
+		params.time_range ? `Focus on information from the past ${params.time_range}.` : undefined,
 		`Query: ${params.query}`,
 	].filter(Boolean).join("\n");
 
-	try {
-		try {
-			await runProcess("codex", [
-				"exec",
-				"--ignore-user-config",
-				"--ephemeral",
-				"--skip-git-repo-check",
-				"--sandbox",
-				"read-only",
-				"-C",
-				tmpdir(),
-				"-c",
-				'model_reasoning_effort="none"',
-				"--output-last-message",
-				outputPath,
-				prompt,
-			], {
-				timeoutMs: SEARCH_TIMEOUT_MS,
-				maxBuffer: 5_000_000,
-				env: { ...process.env, CODEX_DISABLE_MCP: process.env.CODEX_DISABLE_MCP ?? "1" },
-			});
-		} catch (error) {
-			// Codex can still write the final message before returning a non-zero status
-			// (for example on a late stream/telemetry issue). Prefer a parseable result.
-			const maybeRaw = await readFile(outputPath, "utf-8").catch(() => "");
-			if (maybeRaw.trim()) return parseJsonObject(maybeRaw);
-			throw enrichExecError(error);
+	const timeoutSignal = AbortSignal.timeout(SEARCH_TIMEOUT_MS);
+	const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+	const groundingMetadatas: any[] = [];
+
+	const { complete } = await import("@earendil-works/pi-ai/compat");
+	const response = await complete(
+		model,
+		{
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: prompt }],
+					timestamp: Date.now(),
+				},
+			],
+		},
+		{
+			apiKey: auth.apiKey,
+			headers: auth.headers,
+			env: auth.env,
+			signal: combinedSignal,
+			onPayload: (payload: any) => ({
+				...payload,
+				config: {
+					...payload.config,
+					tools: [{ googleSearch: {} }],
+				},
+			}),
+			onProviderStreamEvent: (chunk: any) => {
+				const gm = chunk?.candidates?.[0]?.groundingMetadata;
+				if (gm) groundingMetadatas.push(gm);
+			},
+		},
+	);
+
+	if (response.stopReason === "error" || response.stopReason === "aborted") {
+		throw new Error(response.errorMessage || `Vertex search stopped with reason: ${response.stopReason}`);
+	}
+
+	const summary = response.content
+		.filter((part: any) => part?.type === "text")
+		.map((part: any) => part.text)
+		.join("\n")
+		.trim();
+
+	const rawChunks: Array<{ uri: string; title: string; snippets: string[] }> = [];
+	for (const gm of groundingMetadatas) {
+		const chunks: any[] = Array.isArray(gm.groundingChunks) ? gm.groundingChunks : [];
+		const supports: any[] = Array.isArray(gm.groundingSupports) ? gm.groundingSupports : [];
+		const baseOffset = rawChunks.length;
+		for (const chunk of chunks) {
+			const web = chunk?.web;
+			if (web?.uri) {
+				rawChunks.push({
+					uri: String(web.uri),
+					title: String(web.title || web.domain || "(no title)"),
+					snippets: [],
+				});
+			} else {
+				rawChunks.push({ uri: "", title: "", snippets: [] });
+			}
 		}
-		const raw = await readFile(outputPath, "utf-8");
-		return parseJsonObject(raw);
-	} finally {
-		await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+		for (const support of supports) {
+			const text = String(support?.segment?.text ?? "").trim();
+			const indices: number[] = Array.isArray(support?.groundingChunkIndices) ? support.groundingChunkIndices : [];
+			if (!text) continue;
+			for (const idx of indices) {
+				const target = rawChunks[baseOffset + idx];
+				if (target && !target.snippets.includes(text)) {
+					target.snippets.push(text);
+				}
+			}
+		}
 	}
-}
 
-function runProcess(command: string, args: string[], options: { timeoutMs: number; maxBuffer: number; env: NodeJS.ProcessEnv }): Promise<void> {
-	return new Promise((resolve, reject) => {
-		const child = spawn(command, args, {
-			stdio: ["pipe", "pipe", "pipe"],
-			env: options.env,
-		});
-		// Important: close stdin immediately. `codex exec` otherwise detects piped
-		// stdin and waits with "Reading additional input from stdin..." until it is
-		// killed by our timeout.
-		child.stdin.end();
-
-		let stdout = "";
-		let stderr = "";
-		let settled = false;
-		const timeout = setTimeout(() => {
-			if (settled) return;
-			child.kill("SIGTERM");
-		}, options.timeoutMs);
-
-		child.stdout.on("data", (chunk) => {
-			stdout += String(chunk);
-			if (stdout.length > options.maxBuffer) {
-				child.kill("SIGTERM");
+	const uniqueByUri = new Map<string, { uri: string; title: string; snippets: string[] }>();
+	for (const item of rawChunks) {
+		if (!item.uri) continue;
+		const existing = uniqueByUri.get(item.uri);
+		if (existing) {
+			for (const s of item.snippets) {
+				if (!existing.snippets.includes(s)) existing.snippets.push(s);
 			}
-		});
-		child.stderr.on("data", (chunk) => {
-			stderr += String(chunk);
-			if (stderr.length > options.maxBuffer) {
-				child.kill("SIGTERM");
-			}
-		});
-		child.on("error", (error) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			reject(error);
-		});
-		child.on("close", (code, signal) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			if (code === 0) {
-				resolve();
-				return;
-			}
-			const error = new Error(`Command failed: ${command} ${args.join(" ")}`) as Error & { stdout?: string; stderr?: string; code?: number | null; signal?: NodeJS.Signals | null; killed?: boolean };
-			error.stdout = stdout;
-			error.stderr = stderr;
-			error.code = code;
-			error.signal = signal;
-			error.killed = signal !== null;
-			reject(error);
-		});
-	});
-}
-
-function parseJsonObject(text: string): { summary?: string; results?: unknown[] } {
-	const trimmed = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
-	try {
-		return JSON.parse(trimmed);
-	} catch {
-		const start = trimmed.indexOf("{");
-		const end = trimmed.lastIndexOf("}");
-		if (start >= 0 && end > start) return JSON.parse(trimmed.slice(start, end + 1));
-		throw new Error(`Codex did not return JSON: ${trimmed.slice(0, 300)}`);
+		} else {
+			uniqueByUri.set(item.uri, item);
+		}
 	}
+
+	const limited = Array.from(uniqueByUri.values()).slice(0, maxResults);
+	const results = await Promise.all(
+		limited.map(async (item) => {
+			const resolvedUrl = await resolveGroundingRedirectUrl(item.uri, combinedSignal);
+			return {
+				title: item.title,
+				url: resolvedUrl,
+				content: item.snippets.join(" "),
+				engine: "google-vertex-grounding",
+			};
+		}),
+	);
+
+	return {
+		provider: model.provider,
+		model: model.id,
+		summary,
+		results,
+	};
 }
 
 function normalizeSearchResult(result: any) {
@@ -475,21 +518,6 @@ function errorResult(message: string, details: Record<string, unknown>) {
 		content: [{ type: "text" as const, text: message }],
 		details: { error: message, ...details },
 	};
-}
-
-function enrichExecError(error: unknown): Error {
-	if (!(error instanceof Error)) return new Error(String(error));
-	const extra = error as Error & { stdout?: string; stderr?: string; code?: unknown; signal?: unknown; killed?: boolean };
-	const stderr = extra.stderr?.trim();
-	const stdout = extra.stdout?.trim();
-	const suffix = [
-		extra.code !== undefined ? `code=${String(extra.code)}` : undefined,
-		extra.signal !== undefined ? `signal=${String(extra.signal)}` : undefined,
-		extra.killed ? "killed=true" : undefined,
-		stderr ? `stderr=${stderr.slice(-1000)}` : undefined,
-		stdout ? `stdout=${stdout.slice(-1000)}` : undefined,
-	].filter(Boolean).join("; ");
-	return new Error(suffix ? `${error.message}; ${suffix}` : error.message);
 }
 
 function errorMessage(error: unknown): string {

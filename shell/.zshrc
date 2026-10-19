@@ -7,10 +7,17 @@ if command -v mise >/dev/null 2>&1; then
   eval "$(mise activate zsh)"
 fi
 
-# Google Cloud SDK installed outside Homebrew.
-gcloud_dir="$HOME/google-cloud-sdk"
-[[ -f "$gcloud_dir/path.zsh.inc" ]] && source "$gcloud_dir/path.zsh.inc"
-[[ -f "$gcloud_dir/completion.zsh.inc" ]] && source "$gcloud_dir/completion.zsh.inc"
+# Initialize the completion system before any script calls compdef.
+autoload -Uz compinit && compinit
+
+# Google Cloud SDK (Homebrew gcloud-cli or standalone ~/google-cloud-sdk).
+for gcloud_dir in "$HOME/google-cloud-sdk" /opt/homebrew/share/google-cloud-sdk /usr/local/share/google-cloud-sdk; do
+  if [[ -f "$gcloud_dir/path.zsh.inc" ]]; then
+    source "$gcloud_dir/path.zsh.inc"
+    [[ -f "$gcloud_dir/completion.zsh.inc" ]] && source "$gcloud_dir/completion.zsh.inc"
+    break
+  fi
+done
 unset gcloud_dir
 
 # uv completion.
