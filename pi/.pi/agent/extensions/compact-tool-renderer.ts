@@ -59,7 +59,49 @@ function renderErrorPreview(result: any, options: ToolRenderResultOptions, theme
 	return new Text([...prefix, ...tail.map((line) => theme.fg("error", line))].join("\n"), 0, 0);
 }
 
+const PI_PROMPT_GUIDELINES = [
+	"Batch independent read/search/inspection calls in parallel within a single turn without narrating each step.",
+	"Use codemode only when chaining multiple dependent tool calls or filtering large outputs in JavaScript; use direct tool calls for single operations.",
+	"Before using edit, read the target section and specify a small, unique oldText matching whitespace and newlines exactly.",
+];
+
+function workingMessageForTool(toolName: string, args: any): string {
+	if (toolName === "read" || toolName === "edit" || toolName === "write") {
+		return `${toolName}: ${shortenPath(args?.path)}`;
+	}
+	if (toolName === "bash" || toolName === "powershell") {
+		return `$ ${summarizeCommand(args?.command)}`;
+	}
+	if (toolName === "web_search" || toolName === "web_fetch" || toolName === "grep" || toolName === "find" || toolName === "ls") {
+		const target = args?.query ?? args?.url ?? args?.pattern ?? args?.path ?? "";
+		return `${toolName}: ${summarizeCommand(target)}`;
+	}
+	if (toolName === "codemode") {
+		return "codemode: running script…";
+	}
+	return `${toolName}…`;
+}
+
 export default function compactToolRenderer(pi: ExtensionAPI): void {
+	pi.on("before_agent_start", async (event) => {
+		const guidelines = event.systemPromptOptions.promptGuidelines;
+		for (const item of PI_PROMPT_GUIDELINES) {
+			if (!guidelines.includes(item)) {
+				guidelines.push(item);
+			}
+		}
+	});
+
+	pi.on("tool_execution_start", async (event, ctx) => {
+		if (!ctx.hasUI) return;
+		ctx.ui.setWorkingMessage(workingMessageForTool(event.toolName, event.args));
+	});
+
+	pi.on("tool_execution_end", async (_event, ctx) => {
+		if (!ctx.hasUI) return;
+		ctx.ui.setWorkingMessage("考えています…");
+	});
+
 	pi.registerToolRenderer((toolName, next) => {
 		const base = next();
 

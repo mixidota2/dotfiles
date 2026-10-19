@@ -171,6 +171,9 @@ done
 # when no CLAUDE.md is there, so this applies the global instructions to work
 # under HOME. Claude Code has no user-level AGENTS.md location of its own.
 link_path "$repo_dir/codex/.codex/AGENTS.md" ".claude/AGENTS.md"
+if [ ! -e "$repo_dir/pi/.pi/agent/AGENTS.md" ]; then
+  link_path "$repo_dir/codex/.codex/AGENTS.md" ".pi/agent/AGENTS.md"
+fi
 
 # ~/.claude/settings.json also holds settings written by Claude Code and other
 # apps (such as Orca's hooks), so only the keys this repository manages are
