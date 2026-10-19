@@ -16,6 +16,12 @@ type GateState = {
 	waiver?: string;
 	remindedVersion?: number;
 	reminderCount: number;
+	userPrompt: string;
+	requiresEvidence: boolean;
+	evidenceCount: number;
+	lastAssistantText: string;
+	askedUserQuestion: boolean;
+	evidenceReminded: boolean;
 };
 
 export default function verificationGate(pi: ExtensionAPI): void {
@@ -60,10 +66,45 @@ export default function verificationGate(pi: ExtensionAPI): void {
 	pi.on("session_start", async (_event, ctx) => updateStatus(ctx));
 
 	pi.on("input", async (event, ctx) => {
-		if (event.source !== "extension" && event.streamingBehavior === undefined) reset(ctx);
+		if (event.source !== "extension" && event.streamingBehavior === undefined) {
+			reset(ctx);
+			const text = typeof (event as { text?: unknown }).text === "string" ? (event as { text: string }).text : "";
+			if (text) {
+				state.userPrompt = text;
+				state.requiresEvidence = isSpecOrReasonQuery(text);
+			}
+		}
+	});
+
+	pi.on("before_agent_start", async (event) => {
+		if (event.messageType !== "user") return;
+		const prompt = String(event.prompt ?? "").trim();
+		if (!prompt) return;
+		state.userPrompt = prompt;
+		state.requiresEvidence = isSpecOrReasonQuery(prompt);
+		if (!state.requiresEvidence || state.waiver) return;
+		return {
+			message: {
+				customType: "evidence-gate-contract",
+				content: buildEvidencePrecheckMessage(),
+				display: false,
+			},
+		};
+	});
+
+	pi.on("message_end", async (event) => {
+		const msg = (event as { message?: { role?: string; content?: unknown } }).message;
+		if (msg?.role === "assistant") {
+			const text = extractMessageText(msg.content);
+			if (text) state.lastAssistantText = text;
+		}
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
+		if (event.toolName === "ask_user_question" || event.toolName === "plan_mode_question") {
+			state.askedUserQuestion = true;
+			return;
+		}
 		if (event.toolName !== "bash") return;
 		const command = String((event.input as { command?: unknown }).command ?? "");
 		if (isVerificationCommand(command) && ctx.hasUI) {
@@ -72,14 +113,26 @@ export default function verificationGate(pi: ExtensionAPI): void {
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
+		if (event.toolName === "ask_user_question" || event.toolName === "plan_mode_question") {
+			state.askedUserQuestion = true;
+			return;
+		}
 		if ((event.toolName === "edit" || event.toolName === "write") && !event.isError) {
 			const path = String((event.input as { path?: unknown }).path ?? event.toolName);
 			markMutation(path, ctx);
 			return;
 		}
 
-		if (event.toolName !== "bash") return;
+		if (event.toolName !== "bash") {
+			if (!event.isError && EVIDENCE_TOOLS.has(event.toolName)) {
+				state.evidenceCount += 1;
+			}
+			return;
+		}
 		const command = String((event.input as { command?: unknown }).command ?? "");
+		if (!event.isError && isEvidenceBashCommand(command)) {
+			state.evidenceCount += 1;
+		}
 		if (isVerificationCommand(command)) {
 			state.verification = {
 				command,
@@ -96,27 +149,52 @@ export default function verificationGate(pi: ExtensionAPI): void {
 	pi.on("agent_before_settle", async (event, ctx) => {
 		updateStatus(ctx);
 		if (event.outcome !== "completed" || !event.context.canContinue) return;
-		if (!state.dirty || state.waiver || isFreshPass(state)) return;
-		if (state.remindedVersion === state.mutationVersion || state.reminderCount >= MAX_AUTOMATIC_REMINDERS) {
-			return;
+		if (state.waiver) return;
+
+		if (state.dirty && !isFreshPass(state)) {
+			if (state.remindedVersion === state.mutationVersion || state.reminderCount >= MAX_AUTOMATIC_REMINDERS) {
+				return;
+			}
+
+			state.remindedVersion = state.mutationVersion;
+			state.reminderCount += 1;
+			if (ctx.hasUI) {
+				ctx.ui.setStatus("verification-gate", "… auto-verifying changes");
+			}
+			return {
+				entries: [
+					{
+						type: "custom_message" as const,
+						customType: "verification-gate",
+						content: buildVerificationReminder(state),
+						display: false,
+					},
+				],
+				continue: true,
+			};
 		}
 
-		state.remindedVersion = state.mutationVersion;
-		state.reminderCount += 1;
-		if (ctx.hasUI) {
-			ctx.ui.setStatus("verification-gate", "… auto-verifying changes");
+		if (!state.dirty && state.requiresEvidence && !state.askedUserQuestion && !state.evidenceReminded && state.reminderCount < MAX_AUTOMATIC_REMINDERS) {
+			const assistantText = state.lastAssistantText || extractLatestAssistantText(event.context?.contextMessages);
+			if (needsEvidenceReminder(state, assistantText)) {
+				state.evidenceReminded = true;
+				state.reminderCount += 1;
+				if (ctx.hasUI) {
+					ctx.ui.setStatus("verification-gate", "… verifying evidence");
+				}
+				return {
+					entries: [
+						{
+							type: "custom_message" as const,
+							customType: "verification-gate",
+							content: buildEvidenceReminder(state, assistantText),
+							display: false,
+						},
+					],
+					continue: true,
+				};
+			}
 		}
-		return {
-			entries: [
-				{
-					type: "custom_message" as const,
-					customType: "verification-gate",
-					content: buildVerificationReminder(state),
-					display: false,
-				},
-			],
-			continue: true,
-		};
 	});
 
 	pi.on("agent_end", async (_event, ctx) => {
@@ -154,6 +232,12 @@ function freshState(): GateState {
 		changedFiles: new Set<string>(),
 		mutationVersion: 0,
 		reminderCount: 0,
+		userPrompt: "",
+		requiresEvidence: false,
+		evidenceCount: 0,
+		lastAssistantText: "",
+		askedUserQuestion: false,
+		evidenceReminded: false,
 	};
 }
 
@@ -222,4 +306,120 @@ const MUTATION_PATTERNS: RegExp[] = [
 	/(?:^|[^>=])(?:>>|>)\s*[^&|\s]/,
 ];
 
-export const __test = { isVerificationCommand, isMutatingCommand };
+export const __test = {
+	isVerificationCommand,
+	isMutatingCommand,
+	isSpecOrReasonQuery,
+	isEvidenceBashCommand,
+	hasEvidenceOrUnknownCitation,
+	needsEvidenceReminder,
+};
+
+const EVIDENCE_TOOLS = new Set([
+	"read",
+	"read_symbol",
+	"read_enclosing",
+	"module_report",
+	"project_report",
+	"symbol_search",
+	"effective_config",
+	"lens_diagnostics",
+	"web_search",
+	"web_fetch",
+	"subagent",
+	"codemode",
+	"get_goal",
+	"source_check",
+	"fetch_content",
+	"get_search_content",
+]);
+
+const SPEC_OR_REASON_PATTERNS: RegExp[] = [
+	/[?？]\s*$/,
+	/(?:使える|使えない|できる|できない|可能か|対応してる|対応している|サポートされ)/i,
+	/(?:なぜ|どうして|理由|原因|根拠|仕組み|仕様|どういうこと|本当|ほんと)/i,
+	/(?:どうすれば|どうしたら|対策|防ぐには|どのレベル|何を設定)/i,
+	/\b(?:why|how\s+does|can\s+i|is\s+it\s+possible|what\s+is\s+the\s+evidence|root\s+cause)\b/i,
+];
+
+function isSpecOrReasonQuery(prompt: string): boolean {
+	const trimmed = prompt.trim();
+	if (trimmed.length < 6) return false;
+	return SPEC_OR_REASON_PATTERNS.some((pattern) => pattern.test(trimmed));
+}
+
+function isEvidenceBashCommand(command: string): boolean {
+	const normalized = command.replace(/\\\n/g, " ").replace(/\s+/g, " ").trim();
+	if (!normalized) return false;
+	// Pure env print/echo commands do not count as repository or specification evidence.
+	if (/^(?:printf|echo|pwd|date|whoami|true|false)\b[^|;&]*$/i.test(normalized)) {
+		return false;
+	}
+	return true;
+}
+
+function hasEvidenceOrUnknownCitation(text: string): boolean {
+	const trimmed = text.trim();
+	if (!trimmed) return false;
+	return /\[(?:根拠|未確認)\s*[:：][^\]]+\]/.test(trimmed);
+}
+
+function needsEvidenceReminder(
+	state: Pick<GateState, "requiresEvidence" | "evidenceCount" | "askedUserQuestion">,
+	assistantText: string,
+): boolean {
+	if (!state.requiresEvidence || state.askedUserQuestion) return false;
+	const trimmed = assistantText.trim();
+	if (!trimmed) return false;
+	if (!hasEvidenceOrUnknownCitation(trimmed)) return true;
+	// If the model claims [根拠: ...] without having executed any evidence-gathering tool in this turn,
+	// require an actual inspection tool unless it explicitly answered as [未確認: ...].
+	if (state.evidenceCount === 0 && !/\[未確認\s*[:：][^\]]+\]/.test(trimmed)) {
+		return true;
+	}
+	return false;
+}
+
+function buildEvidencePrecheckMessage(): string {
+	return `[EVIDENCE CONTRACT]
+この質問は仕様・可否・原因・根拠・対策に関するものです。回答前に以下を厳守してください：
+1. 1つのファイル（低レイヤのSDKや認証コード等）だけを見て結論を出さず、CLI本体・設定スキーマ・ドキュメント（docs/）・警告メッセージ定義まで横断検索（grep / rg / read / web_search）して裏付けを取ること。
+2. 主要な主張ごとに直接確認した一次情報を \`[根拠: <ファイルパス:行番号 | 実行コマンド | 公式URL>]\` の形式で明記すること。
+3. ツール出力で直接確認していない境界条件や効果を推論で補完せず、未確認事項は必ず \`[未確認: <未確認の論点と確認方法>]\` と明記すること。`;
+}
+
+function buildEvidenceReminder(state: Pick<GateState, "evidenceCount">, assistantText: string): string {
+	const missingTools = state.evidenceCount === 0
+		? "- このターンでファイル読取・検索・Web確認などの調査ツールが実行されていません（環境変数の表示等は仕様の根拠になりません）。\n"
+		: "";
+	const missingTags = !hasEvidenceOrUnknownCitation(assistantText)
+		? "- 回答内に `[根拠: <ファイルパス:行番号 | 実行コマンド | 公式URL>]` または `[未確認: <未確認の論点と確認方法>]` の明記がありません。\n"
+		: "";
+	return `[EVIDENCE GATE]
+仕様・原因・対策に関する回答で、裏付け調査または根拠の明示が不足しています：
+${missingTools}${missingTags}
+推測や記憶で結論・原因・対策（存在しない設定値や未検証の因果関係など）を補完せず、今すぐ関連コード・設定・ドキュメント・警告定義を実際にツールで調査し、各主張に \`[根拠: ...]\`（未確認の点は \`[未確認: ...]\`）を付記して回答し直してください。`;
+}
+
+function extractMessageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part): part is { type?: string; text?: string } => !!part && typeof part === "object")
+		.filter((part) => part.type === "text" && typeof part.text === "string")
+		.map((part) => part.text!)
+		.join("\n")
+		.trim();
+}
+
+function extractLatestAssistantText(messages: unknown): string {
+	if (!Array.isArray(messages)) return "";
+	for (let i = messages.length - 1; i >= 0; i -= 1) {
+		const msg = messages[i] as { role?: string; content?: unknown } | undefined;
+		if (msg?.role === "assistant") {
+			const text = extractMessageText(msg.content);
+			if (text) return text;
+		}
+	}
+	return "";
+}

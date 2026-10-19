@@ -75,8 +75,6 @@ function sensitivePathReason(abs: string): string | undefined {
 }
 
 function guardedPathReason(abs: string): string | undefined {
-	if (isInside(abs, resolve(HOME, ".pi", "agent", "extensions"))) return "Editing global pi extensions.";
-	if (isInside(abs, resolve(HOME, ".pi", "agent", "settings.json"))) return "Editing global pi settings.";
 	if (abs.endsWith("package-lock.json") || abs.endsWith("pnpm-lock.yaml") || abs.endsWith("yarn.lock") || abs.endsWith("uv.lock")) return "Editing a lockfile.";
 }
 

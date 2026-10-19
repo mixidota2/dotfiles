@@ -18,5 +18,6 @@
   "hideThinkingBlock": true,
   "modelThinkingLevels": {
     "google-vertex/gemini-4-argon": "medium"
-  }
+  },
+  "lastChangelogVersion": "1.3.0"
 }
