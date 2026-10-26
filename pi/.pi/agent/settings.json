@@ -4,7 +4,10 @@
   "defaultModel": "gemini-4-argon",
   "defaultThinkingLevel": "medium",
   "defaultTools": [
-    "+codemode"
+    "+codemode",
+    "+grep",
+    "+find",
+    "+ls"
   ],
   "packages": [
     "npm:pi-subagents",
