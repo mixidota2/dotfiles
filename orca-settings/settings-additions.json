@@ -9,7 +9,7 @@
   "theme": "dark",
   "appFontFamily": "Geist",
   "editorWordWrap": true,
-  "terminalFontSize": 14,
+  "terminalFontSize": 18,
   "terminalFontFamily": "SF Mono",
   "terminalFontWeight": 500,
   "terminalFontWeightBold": 700,
