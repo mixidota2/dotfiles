@@ -13,7 +13,7 @@ import yaml
 REPO = Path(__file__).resolve().parents[1]
 LOCAL = REPO / "skills-local/.codex/skills"
 NAMES = {
-    "create-validated-skill", "design-python-code", "eli5", "explain-before-shorten",
+    "create-validated-skill", "design-adk-ai-app", "design-python-code", "eli5", "explain-before-shorten",
     "herdr", "pi-extension-development", "sanitize-artifacts", "write-design-doc",
 }
 
