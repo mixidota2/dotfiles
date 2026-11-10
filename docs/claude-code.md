@@ -33,9 +33,10 @@ v2.1.277 or later.
 
 By default Claude Code reads `AGENTS.md` only when there is no `CLAUDE.md`,
 `.claude/CLAUDE.md`, or `CLAUDE.local.md` in the working directory or above it.
-`claude/settings-additions.json` sets
+`claude/settings-additions.json` sets `"language": "日本語"` and sets
 [**Project instructions** to `claude-md-and-agents-md`](https://code.claude.com/docs/en/memory#choose-which-instruction-files-load)
-so the global instructions also load in repositories that have a `CLAUDE.md`.
+so Claude Code responds in Japanese by default and the global instructions also
+load in repositories that have a `CLAUDE.md`.
 
 ## Settings
 
@@ -49,7 +50,7 @@ another setting here, add its key to `claude/settings-additions.json`.
 
 ## Skills
 
-The six directories in `skills-local/.codex/skills` are the shared source of truth.
+The eight directories in `skills-local/.codex/skills` are the shared source of truth.
 The installer links each directory separately into `~/.claude/skills`, a
 [personal skill location supported by Claude Code](https://code.claude.com/docs/en/skills).
 Individual directory symlinks are supported. Unmarked local skill directories with a
@@ -81,7 +82,7 @@ Start a new Claude Code session and check `/skills`. Invoke `/tk`, `/eli5 topic`
 These are Claude Code slash commands; the `$skill-name` examples and statement
 that `/eli5` is not a command in the shared instructions describe Codex only.
 
-All six local skills have standard `name` and `description` frontmatter, but
+All eight local skills have standard `name` and `description` frontmatter, but
 being discoverable does not guarantee every workflow is agent-independent:
 
 - `create-validated-skill` shares its creation workflow and evaluation manifests

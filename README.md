@@ -61,7 +61,7 @@ This repository starts from a reviewed file snapshot with a fresh Git history. P
 - `orca`: `~/.orca/keybindings.json` and portable preferences merged from `orca-settings/settings-additions.json` into `profile-state.db` when an Orca profile is present; workspaces, sessions, and credentials remain local. See [the macOS shortcut mapping](docs/orca-shortcuts.md).
 - `pi`: global instructions, preferences (`gemini-4-argon` on `google-vertex`, `codemode`, and configured npm packages), and custom extensions (`--tools` restores extension dependencies and reconciles configured Pi packages).
 - `codex`: global `AGENTS.md` instructions and reusable approval rules. `~/.codex/config.toml`, including project trust and generated settings, remains local to each computer.
-- Claude Code: individual links to the six local skill directories under `~/.claude/skills`, `~/.claude/AGENTS.md` linked to the shared global `AGENTS.md`, and the keys in `claude/settings-additions.json` merged into `~/.claude/settings.json`; other settings, authentication, account-synced skills, and other user skills remain local.
+- Claude Code: individual links to the seven local skill directories under `~/.claude/skills`, `~/.claude/AGENTS.md` linked to the shared global `AGENTS.md`, and the keys in `claude/settings-additions.json` merged into `~/.claude/settings.json`; other settings, authentication, account-synced skills, and other user skills remain local.
 - `tk`: configuration only. The CLI is installed as a uv tool and its task database remains local.
 - `skills-local`: locally maintained skills. The external tk skill is restored by `skills/install.sh`.
 

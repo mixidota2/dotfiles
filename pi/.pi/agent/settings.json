@@ -22,5 +22,20 @@
   "modelThinkingLevels": {
     "google-vertex/gemini-4-argon": "medium"
   },
-  "lastChangelogVersion": "1.3.0"
+  "subagents": {
+    "agentOverrides": {
+      "delegate": {
+        "model": "google-vertex/gemini-3.8-flash",
+        "thinking": "low",
+        "acceptanceRole": "read-only"
+      },
+      "scout": {
+        "model": "google-vertex/gemini-3.8-flash",
+        "thinking": "low",
+        "output": false,
+        "acceptanceRole": "read-only"
+      }
+    }
+  },
+  "lastChangelogVersion": "1.4.0"
 }

@@ -1,4 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync } from "node:fs";
+import { basename, extname, isAbsolute, resolve } from "node:path";
 
 const MAX_AUTOMATIC_REMINDERS = 2;
 
@@ -11,13 +13,16 @@ type Verification = {
 type GateState = {
 	dirty: boolean;
 	changedFiles: Set<string>;
+	touchedMarkdownFiles: Set<string>;
 	mutationVersion: number;
 	verification?: Verification;
 	waiver?: string;
 	remindedVersion?: number;
+	docQualityRemindedVersion?: number;
 	reminderCount: number;
 	userPrompt: string;
 	requiresEvidence: boolean;
+	proposalOnly: boolean;
 	evidenceCount: number;
 	lastAssistantText: string;
 	askedUserQuestion: boolean;
@@ -72,6 +77,7 @@ export default function verificationGate(pi: ExtensionAPI): void {
 			if (text) {
 				state.userPrompt = text;
 				state.requiresEvidence = isSpecOrReasonQuery(text);
+				state.proposalOnly = isProposalOnlyPrompt(text);
 			}
 		}
 	});
@@ -82,11 +88,20 @@ export default function verificationGate(pi: ExtensionAPI): void {
 		if (!prompt) return;
 		state.userPrompt = prompt;
 		state.requiresEvidence = isSpecOrReasonQuery(prompt);
-		if (!state.requiresEvidence || state.waiver) return;
+		state.proposalOnly = isProposalOnlyPrompt(prompt);
+		if (state.waiver) return;
+		const contracts: string[] = [];
+		if (state.proposalOnly && !state.askedUserQuestion) {
+			contracts.push(buildProposalOnlyPrecheckMessage());
+		}
+		if (state.requiresEvidence) {
+			contracts.push(buildEvidencePrecheckMessage());
+		}
+		if (contracts.length === 0) return;
 		return {
 			message: {
 				customType: "evidence-gate-contract",
-				content: buildEvidencePrecheckMessage(),
+				content: contracts.join("\n\n"),
 				display: false,
 			},
 		};
@@ -105,6 +120,23 @@ export default function verificationGate(pi: ExtensionAPI): void {
 			state.askedUserQuestion = true;
 			return;
 		}
+		if (state.proposalOnly && !state.askedUserQuestion && !state.waiver) {
+			if (event.toolName === "edit" || event.toolName === "write") {
+				return {
+					block: true,
+					reason: "Proposal/consultation-only request detected: do not run edit/write before presenting your proposal to the user and obtaining approval (or confirming via ask_user_question).",
+				};
+			}
+			if (event.toolName === "bash") {
+				const cmd = String((event.input as { command?: unknown }).command ?? "");
+				if (isMutatingCommand(cmd)) {
+					return {
+						block: true,
+						reason: "Proposal/consultation-only request detected: mutating bash commands are blocked until you present your proposal and obtain user approval.",
+					};
+				}
+			}
+		}
 		if (event.toolName !== "bash") return;
 		const command = String((event.input as { command?: unknown }).command ?? "");
 		if (isVerificationCommand(command) && ctx.hasUI) {
@@ -119,6 +151,11 @@ export default function verificationGate(pi: ExtensionAPI): void {
 		}
 		if ((event.toolName === "edit" || event.toolName === "write") && !event.isError) {
 			const path = String((event.input as { path?: unknown }).path ?? event.toolName);
+			const cwd = ctx?.cwd ?? process.cwd();
+			const absPath = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
+			if (isTargetMarkdownPath(absPath)) {
+				state.touchedMarkdownFiles.add(absPath);
+			}
 			markMutation(path, ctx);
 			return;
 		}
@@ -150,6 +187,28 @@ export default function verificationGate(pi: ExtensionAPI): void {
 		updateStatus(ctx);
 		if (event.outcome !== "completed" || !event.context.canContinue) return;
 		if (state.waiver) return;
+
+		if (state.touchedMarkdownFiles.size > 0 && state.docQualityRemindedVersion !== state.mutationVersion && state.reminderCount < MAX_AUTOMATIC_REMINDERS) {
+			const docFindings = collectTouchedMarkdownFindings(state.touchedMarkdownFiles);
+			if (docFindings.hard.length > 0) {
+				state.docQualityRemindedVersion = state.mutationVersion;
+				state.reminderCount += 1;
+				if (ctx.hasUI) {
+					ctx.ui.setStatus("verification-gate", "… checking document quality");
+				}
+				return {
+					entries: [
+						{
+							type: "custom_message" as const,
+							customType: "verification-gate",
+							content: buildMarkdownQualityReminder(docFindings),
+							display: false,
+						},
+					],
+					continue: true,
+				};
+			}
+		}
 
 		if (state.dirty && !isFreshPass(state)) {
 			if (state.remindedVersion === state.mutationVersion || state.reminderCount >= MAX_AUTOMATIC_REMINDERS) {
@@ -230,10 +289,12 @@ function freshState(): GateState {
 	return {
 		dirty: false,
 		changedFiles: new Set<string>(),
+		touchedMarkdownFiles: new Set<string>(),
 		mutationVersion: 0,
 		reminderCount: 0,
 		userPrompt: "",
 		requiresEvidence: false,
+		proposalOnly: false,
 		evidenceCount: 0,
 		lastAssistantText: "",
 		askedUserQuestion: false,
@@ -310,10 +371,142 @@ export const __test = {
 	isVerificationCommand,
 	isMutatingCommand,
 	isSpecOrReasonQuery,
+	isProposalOnlyPrompt,
 	isEvidenceBashCommand,
 	hasEvidenceOrUnknownCitation,
 	needsEvidenceReminder,
+	inspectMarkdownQuality,
+	isTargetMarkdownPath,
 };
+
+const PROHIBITED_DOC_PATTERNS: Array<[RegExp, string]> = [
+	[/失うもの/, "「失うもの」という不自然な定型表現は使わず、「トレードオフ」または自然な文（「その代わり〜」）に直してください。"],
+	[/使う人/, "「使う人」という相対呼称は使わず、具体的な役割名（売場構成企画部の担当者、事業部の担当者、需要予測Gなど）を主語にしてください。"],
+	[/解決の道筋/, "「解決の道筋」という表現は「解決策」に直してください。"],
+	[/^#{1,4}\s*(?:作るもの|設計の[0-9０-９一二三四五六七八九十]*つの柱|設計の柱)\s*$/, "「作るもの」「設計の柱」のような曖昧な見出しは避け、具体的な設計対象または標準見出しにしてください。"],
+];
+
+const SUBJECTLESS_GOAL_PATTERN = /(?:流れが一通り|一通りローカルで動く|ローカルで動くこと|動くようにする)\s*[。．]?$/;
+const CHANGE_SCENARIO_HINT_PATTERN = /(?:変更シナリオ|変えるとき|変えたとき|増やしたとき|追加したとき|直す場所|変更箇所|波及)/;
+const CODE_DESIGN_BAD_FILENAME_PATTERN = /(?:^|[\s/│├└─`])(model\.py|table\.py|apply\.py|recommend\.py|operations\.py|utils\.py|common\.py|helpers\.py)(?=$|[\s`#):])/m;
+
+function isTargetMarkdownPath(filePath: string): boolean {
+	if (!filePath || extname(filePath).toLowerCase() !== ".md") return false;
+	const name = basename(filePath);
+	if (name === "SKILL.md" || name === "AGENTS.md" || name === "CLAUDE.md" || name === "APPEND_SYSTEM.md") {
+		return false;
+	}
+	if (filePath.includes("/skills/") || filePath.includes("/skills-local/")) {
+		return false;
+	}
+	return true;
+}
+
+function inspectMarkdownQuality(filePath: string, text: string): { hard: string[]; advisory: string[] } {
+	const hard: string[] = [];
+	const advisory: string[] = [];
+	const lines = text.split(/\r?\n/);
+	const allLines: Array<{ lineNo: number; text: string }> = lines.map((line, i) => ({ lineNo: i + 1, text: line }));
+	const visible: Array<{ lineNo: number; text: string }> = [];
+	let inFence = false;
+	for (let i = 0; i < lines.length; i += 1) {
+		const line = lines[i];
+		if (line.trim().startsWith("```")) {
+			inFence = !inFence;
+			continue;
+		}
+		if (!inFence) visible.push({ lineNo: i + 1, text: line });
+	}
+
+	for (const [pattern, message] of PROHIBITED_DOC_PATTERNS) {
+		const matched = visible.filter((item) => pattern.test(item.text)).map((item) => `L${item.lineNo}`);
+		if (matched.length > 0) {
+			hard.push(`- ${filePath} (${matched.slice(0, 5).join(", ")}): ${message}`);
+		}
+	}
+
+	const lowerName = basename(filePath).toLowerCase();
+	const isDesignDoc = lowerName.includes("design-doc") || lowerName.includes("design_doc") ||
+		(text.includes("## Context and Scope") && text.includes("## Goals and Non-goals"));
+	if (isDesignDoc) {
+		const goalsLines = extractMarkdownSection(visible, /^Goals\b/i);
+		for (const item of goalsLines) {
+			const trimmed = item.text.trim();
+			if (/^(?:[-*]|\d+\.)\s+/.test(trimmed) && SUBJECTLESS_GOAL_PATTERN.test(trimmed)) {
+				hard.push(`- ${filePath} (L${item.lineNo}): Goal に主語と達成状態がありません（「誰が・何を見て・何を判断/操作でき・どういう状態になるか」の文に直してください）。`);
+			}
+		}
+		const codeDesignLines = extractMarkdownSection(allLines, /^Code design\b/i);
+		if (codeDesignLines.length > 0) {
+			const codeDesignText = codeDesignLines.map((item) => item.text).join("\n");
+			const badFileMatches = codeDesignLines
+				.filter((item) => CODE_DESIGN_BAD_FILENAME_PATTERN.test(item.text))
+				.map((item) => `L${item.lineNo}`);
+			if (badFileMatches.length > 0) {
+				hard.push(`- ${filePath} (${badFileMatches.slice(0, 5).join(", ")}): Code design に多義語・曖昧語・動詞1つの細切れファイル名（model.py, table.py, apply.py, recommend.py, operations.py, utils.py 等）が含まれています。共有データモデルは models/<概念名>.py に集約し、専門モジュールと use_cases/ を分け、リーダブルコードの命名原則に沿った具体的な名前へ直してください。`);
+			}
+			if (!CHANGE_SCENARIO_HINT_PATTERN.test(codeDesignText)) {
+				advisory.push(`- ${filePath} (Code design): 代表的な変更シナリオ（モデル追加、画面変更、予測対象追加、最適化手法追加、データソース変更、保存項目追加、ログ追加など）ごとに変更箇所が局所化されているかの検証を補ってください。`);
+			}
+		}
+	}
+
+	return { hard, advisory };
+}
+
+function extractMarkdownSection(
+	visible: Array<{ lineNo: number; text: string }>,
+	headingPattern: RegExp,
+): Array<{ lineNo: number; text: string }> {
+	let collecting = false;
+	let level = 0;
+	const out: Array<{ lineNo: number; text: string }> = [];
+	for (const item of visible) {
+		const m = item.text.trim().match(/^(#{1,6})\s+(.*)$/);
+		if (m) {
+			const curLevel = m[1].length;
+			const title = m[2].trim();
+			if (headingPattern.test(title)) {
+				collecting = true;
+				level = curLevel;
+				continue;
+			}
+			if (collecting && curLevel <= level) break;
+		} else if (collecting) {
+			out.push(item);
+		}
+	}
+	return out;
+}
+
+function collectTouchedMarkdownFindings(files: Set<string>): { hard: string[]; advisory: string[] } {
+	const hard: string[] = [];
+	const advisory: string[] = [];
+	for (const filePath of files) {
+		if (!isTargetMarkdownPath(filePath) || !existsSync(filePath)) continue;
+		try {
+			const text = readFileSync(filePath, "utf8");
+			const res = inspectMarkdownQuality(filePath, text);
+			hard.push(...res.hard);
+			advisory.push(...res.advisory);
+		} catch {
+			// Ignore unreadable files.
+		}
+	}
+	return { hard, advisory };
+}
+
+function buildMarkdownQualityReminder(findings: { hard: string[]; advisory: string[] }): string {
+	const items = [...findings.hard, ...findings.advisory].join("\n");
+	return `[DOCUMENT QUALITY GATE]
+作成・編集した Markdown 文書に、手戻りの原因になる禁止表現または主語欠落が検出されました：
+${items}
+
+ユーザーへ完了報告する前に以下を実施して修正してください：
+1. 上記の該当箇所を修正する。
+2. 書き出したファイル全文を頭から読み直し、すべての文に「誰が・何に対して・何をする（どうなる）か」の主語と述語があるか確かめる。
+3. 元の分析の指標（売上・粗利・客数）や用語（DPT と部門など）の揺れ・節間の前後矛盾、および頼まれていないエンハンス項目の混入がないか確かめる。`;
+}
 
 const EVIDENCE_TOOLS = new Set([
 	"read",
@@ -378,6 +571,40 @@ function needsEvidenceReminder(
 		return true;
 	}
 	return false;
+}
+
+const PROPOSAL_ONLY_PATTERNS: RegExp[] = [
+	/(?:提案して|提案だけ|案を出して|案を考えて|アイデアを出して)/i,
+	/(?:どう思う|どう考える|どうしたらいい|どうすればいい|どういう設計|どういう構成|どんな構成)/i,
+	/(?:相談したい|議論しよう|議論したい|検討したい|比較して|まずは教えて|まず教えて|構成を知りたい)/i,
+	/\b(?:propose|proposal only|what do you think|how should we design)\b/i,
+];
+
+const EXPLICIT_IMPLEMENTATION_PATTERNS: RegExp[] = [
+	/(?:実装して|直して|修正して|書き換えて|変更して|反映して|更新して|追加して|消して|削除して|作って|書いて|作成して|設定して|コミットして|進めて|進めよう|済むようにして|やめて欲しい|やめてほしい|やって)/i,
+	/\b(?:implement|fix|edit|write|update|apply|create|refactor|commit)\b/i,
+	/\[DESIGN PLAN MODE CONTRACT\]/i,
+	/Implement these selected Pi harness improvements/i,
+];
+
+function isProposalOnlyPrompt(prompt: string): boolean {
+	const trimmed = prompt.trim();
+	if (!trimmed) return false;
+	const userPart = trimmed.split(/\n\[(?:TK HANDOFF|EVIDENCE|DESIGN PLAN)/)[0]?.trim() ?? trimmed;
+	if (!PROPOSAL_ONLY_PATTERNS.some((pattern) => pattern.test(userPart))) {
+		return false;
+	}
+	if (EXPLICIT_IMPLEMENTATION_PATTERNS.some((pattern) => pattern.test(userPart))) {
+		return false;
+	}
+	return true;
+}
+
+function buildProposalOnlyPrecheckMessage(): string {
+	return `[PROPOSAL-ONLY BOUNDARY CONTRACT]
+この依頼は提案・設計相談・方針検討を求めるものです。以下を厳守してください：
+1. ツールを呼ぶ前にまず1〜2文で「何を調べて提案するか」を短く返答する。
+2. ファイル編集（\`edit\` / \`write\`）や状態変更コマンドは実行せず、読み取り調査と提案・選択肢の提示（または \`ask_user_question\` での合意形成）までに留める。`;
 }
 
 function buildEvidencePrecheckMessage(): string {

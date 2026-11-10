@@ -23,11 +23,10 @@ runtime checkが必要でなければ`@runtime_checkable`を付けない。Proto
 ## Package facade
 
 ```python
-# ordering/__init__.py
-from .model import Order, OrderId
-from .place_order import PlaceOrder, PlaceOrderResult
+# forecasting/__init__.py
+from .evaluation import evaluate_leave_one_out
 
-__all__ = ["Order", "OrderId", "PlaceOrder", "PlaceOrderResult"]
+__all__ = ["evaluate_leave_one_out"]
 ```
 
 facadeは安定させたい公開面がある場合に使う。application内部の小packageへ一律に作らない。

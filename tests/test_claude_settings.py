@@ -93,6 +93,7 @@ class MergeClaudeSettingsTests(unittest.TestCase):
 
     def test_repository_additions_read_agents_md_with_claude_md(self):
         additions = json.loads(ADDITIONS.read_text())
+        self.assertEqual(additions["language"], "日本語")
         options = additions["pluginConfigs"]["cc-plugin-agents-md@builtin"]["options"]
         self.assertEqual(options, {"instructionFiles": "claude-md-and-agents-md"})
 

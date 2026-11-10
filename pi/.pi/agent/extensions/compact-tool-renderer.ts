@@ -5,6 +5,23 @@ import { homedir } from "node:os";
 const HOME = homedir();
 const MAX_CMD_Preview_CHARS = 88;
 const MAX_ERROR_LINES = 5;
+const IMAGE_PATH_RE = /\.(?:png|jpe?g|gif|webp|bmp|svg)$/i;
+
+function isImagePath(rawPath: unknown): boolean {
+	return typeof rawPath === "string" && IMAGE_PATH_RE.test(rawPath.trim());
+}
+
+function hasImageContent(result: { content?: Array<{ type?: string; mimeType?: string }> } | undefined): boolean {
+	if (!result || !Array.isArray(result.content)) return false;
+	return result.content.some((part) => part?.type === "image");
+}
+
+function extractImageSummary(result: { content?: Array<{ type?: string; text?: string; mimeType?: string }> } | undefined): string {
+	const text = extractText(result);
+	if (text) return text;
+	const img = result?.content?.find((part) => part?.type === "image");
+	return img?.mimeType ? `Read image file [${img.mimeType}]` : "Read image file";
+}
 
 function shortenPath(rawPath: unknown): string {
 	const value = typeof rawPath === "string" ? rawPath.trim() : "";
@@ -60,7 +77,8 @@ function renderErrorPreview(result: any, options: ToolRenderResultOptions, theme
 }
 
 const PI_PROMPT_GUIDELINES = [
-	"Batch independent read/search/inspection calls in parallel within a single turn without narrating each step.",
+	"Before starting tool calls (reads, searches, bash commands, edits, or subagents) on the first turn of a request, always output a brief 1-2 sentence response telling the user what you are about to check or do (like ChatGPT), then batch independent tool calls in parallel without narrating every intermediate step.",
+	"When the user asks for a proposal, design, opinion, or consultation without explicitly asking to implement/edit files, do not run edit/write or mutating bash commands — present the proposal and confirm first.",
 	"Use codemode only when chaining multiple dependent tool calls or filtering large outputs in JavaScript; use direct tool calls for single operations.",
 	"Before using edit, read the target section and specify a small, unique oldText matching whitespace and newlines exactly.",
 ];
@@ -147,7 +165,8 @@ export default function compactToolRenderer(pi: ExtensionAPI): void {
 		return {
 			renderShell: "self",
 			renderCall(args: any, theme: any, context: ToolRenderContext) {
-				if (context.expanded) {
+				const imageRead = toolName === "read" && isImagePath(args?.file_path ?? args?.path);
+				if (context.expanded || imageRead) {
 					if (base?.renderCall) return base.renderCall(args, theme, context);
 					return new Text(
 						`${theme.fg("toolTitle", theme.bold(formatToolSummary(toolName, args)))}${renderStatusBadge(theme, context)}`,
@@ -165,12 +184,24 @@ export default function compactToolRenderer(pi: ExtensionAPI): void {
 				return new Text("", 0, 0);
 			},
 			renderResult(result: any, options: ToolRenderResultOptions, theme: any, context: ToolRenderContext) {
+				const imageRead = toolName === "read" && (hasImageContent(result) || isImagePath((context as any)?.args?.file_path ?? (context as any)?.args?.path));
 				if (options.expanded) {
 					if (base?.renderResult) return base.renderResult(result, options, theme, context);
 					return new Text(theme.fg("toolOutput", extractText(result)), 0, 0);
+				}
+				if (imageRead && !context.isError) {
+					return new Text(theme.fg("muted", extractImageSummary(result)), 0, 0);
 				}
 				return renderErrorPreview(result, options, theme, context);
 			},
 		};
 	});
 }
+
+export const __test = {
+	isImagePath,
+	hasImageContent,
+	extractImageSummary,
+	formatToolSummary,
+	workingMessageForTool,
+};
