@@ -79,7 +79,7 @@ class SkillValidationTests(unittest.TestCase):
 
     def test_all_six_installed_skills_pass_without_mutating_historical_files(self):
         installed = sorted(path for path in SKILLS.iterdir() if (path / "SKILL.md").is_file())
-        self.assertEqual(len(installed), 9)
+        self.assertEqual(len(installed), 10)
         before = {path: path.read_bytes() for skill in installed for path in (skill / "evals").rglob("*.yaml")}
         for skill in installed:
             with self.subTest(skill=skill.name):
