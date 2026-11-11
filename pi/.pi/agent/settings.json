@@ -1,7 +1,7 @@
 {
   "theme": "dark",
   "defaultProvider": "google-vertex",
-  "defaultModel": "gemini-4-argon",
+  "defaultModel": "gemini-4-carbon",
   "defaultThinkingLevel": "medium",
   "defaultTools": [
     "+codemode",
@@ -37,5 +37,12 @@
       }
     }
   },
-  "lastChangelogVersion": "1.4.0"
+  "lastChangelogVersion": "1.5.2",
+  "extensionChangelogVersions": {
+    "{\"source\":\"npm:pi-subagents\",\"scope\":\"user\"}": "0.88.0",
+    "{\"source\":\"npm:@gotgenes/pi-permission-system\",\"scope\":\"user\"}": "42.0.0",
+    "{\"source\":\"npm:pi-powerline-footer\",\"scope\":\"user\"}": "0.22.0",
+    "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}": "4.4.12",
+    "{\"source\":\"npm:@narumitw/pi-plan-mode\",\"scope\":\"user\"}": "0.60.0"
+  }
 }
