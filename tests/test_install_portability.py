@@ -229,7 +229,7 @@ class InstallerPortabilityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.log.read_text().splitlines(), [
             "brew", "bundle", "--file", str(self.repo / "Brewfile"),
-            "npm", "--prefix", str(self.home / ".pi/agent/extensions/web-tools"),
+            "npm", "--prefix", str(self.repo / "pi/.pi/agent/extensions/web-tools"),
             "ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund",
             "pi", "update", "--extensions",
         ])

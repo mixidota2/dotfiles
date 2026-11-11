@@ -139,7 +139,8 @@ install_user_tools() {
       printf 'npm was not found after brew bundle.\n' >&2
       exit 1
     fi
-    run npm --prefix "$HOME/.pi/agent/extensions/web-tools" ci --omit=dev --ignore-scripts --no-audit --no-fund
+    # index.ts is symlinked into $HOME; pi resolves imports from its real path here.
+    run npm --prefix "$repo_dir/pi/.pi/agent/extensions/web-tools" ci --omit=dev --ignore-scripts --no-audit --no-fund
   fi
 
   if [ -f "$repo_dir/pi/.pi/agent/settings.json" ]; then
