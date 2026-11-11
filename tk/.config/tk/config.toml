@@ -1,5 +1,5 @@
 [board]
-done_retention_days = 14
+done_retention_days = 7
 
 [record]
 stale_after_days = 30
