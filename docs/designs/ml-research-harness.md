@@ -1,233 +1,337 @@
-# ML Research Harness — Design Doc
+# ML Research Harness 設計書
 
-> Status: Implementation-ready Draft（設計判断は合意済み、コード・live統合は未検証）  
-> Updated: 2026-11-17  
-> Audience: 別のGitHubアカウント・環境で実装を引き継ぐ人間／コーディングエージェント  
-> Scope: 汎用ML研究開発ハーネス。実際の業務データ、資格情報、秘密のGCPリソースは含めない。
-
-## 0. 決定事項（まず読む）
-
-**C1：Skill主導＋実験ツール**を採用する。Codex等のエージェントが研究上の判断、データ分析、コード実装、次の実験選択を行い、Pythonは実験の記録・実行・評価・再現性を保証する。最初のControl Planeはローカル。重い学習だけをリモートに送れるようにする。
-
-| 設計要素 | 採用した方針 |
+| 項目 | 内容 |
 | --- | --- |
-| 研究制御 | Skill主導。初期にはPython製の研究Supervisorを作らない |
-| 配布 | 1リポジトリ内にSkill／プラグイン設定と独立実行可能なPython CLI・ライブラリを同梱 |
-| 実験管理 | ローカルSQLiteを正本とし、GitとArtifact Storageに不変なコード・結果を保存 |
-| タスク・知見管理 | 既存のtk/tasukuraを維持。実験DBと二重管理しない |
-| データ取得 | 認可されたBigQuery等のデータ範囲でSQLとデータ加工は自由 |
-| 評価 | 評価用SQL、データSnapshot、分割、ラベル定義、指標、EvaluatorをProtocolとして固定 |
-| 実行 | 候補内部のMLパイプラインは自由。評価用Artifactの契約だけ共通化 |
-| 階層 | Approach → Candidate → Run → Attempt。SearchCampaignは探索活動をまとめる別軸 |
-| ハイパーパラメータ | Loss選択、特徴量フラグ、seedを含む具体的な解決済みパラメータはRunへ |
-| 研究ブランチ | 構造的に異なるApproach・並行競合する変更に限りworktreeを分岐 |
-| Accept | Verified Runを有望な解法として採用。複数並立できる |
-| Promote | Accepted Runをmainへ直接mergeせず、整えて再評価したコードをPRで統合 |
-| AlphaEvolve | 初期から専用Adapterを作成。公式クライアントと共通Evaluatorを接続 |
-| リモート実行 | ジョブ投入・状態取得・回収の契約を初期から定義。Local Backendを先行 |
+| ステータス | Draft：基本設計を提案済み。実装と外部サービスへの接続は未検証 |
+| 更新日 | 2026-11-17 |
+| 想定読者 | 機械学習エンジニア、実装を担当するコーディングエージェント |
+| 文書の目的 | 新しい開発環境で実装を開始できるよう、要件・構造・判断理由・検証方法を定義する |
+| 実装先 | 本文書とは別のML Research Harnessリポジトリ。名称とURLは未定 |
 
-この文書のコマンド名・データ型・ディレクトリは**実装提案**であり、現存するCLIやAPIではない。未決事項は第13節へ明示する。
+## 1. 概要
 
-## 1. 目的と非目標
+ML Research Harnessは、コーディングエージェントに機械学習モデルの研究開発を任せるための仕組みである。データの調査と取得、学習データの作成、評価方法の設計、ベースラインの実装、改善実験、結果の分析、完成コードと研究レポートの作成までを扱う。
 
-### 目的
+中心となるのは、CodexやClaude Codeなどの既存のコーディングエージェントである。エージェントはSkillに従って研究上の判断とコード変更を行う。一方、Python製の実験ツールは実行条件、評価結果、コードとデータのバージョン、障害時の状態を保存する。
 
-- エージェントがデータ取得SQL、EDA、データ品質・バイアス調査、学習データ作成、分割設計、ベースライン実装からモデル改善まで実施する。
-- LightGBM、NN、時系列、二段階モデル、アンサンブルなど、全く異なる解法を自由に検討する。
-- 任意の評価・分析形式で成果物を出力する。数値の正本は共通のEvaluatorで計算する。
-- 成功・失敗・研究上の示唆を残し、最終的に整理されたコード、再現可能な実験結果、試行錯誤のレポートを出力する。
-- 大きなアプローチを並行に長期間育てても、mainの品質と単純さを損なわない。
-- 最初はローカル主体で運用し、GPUなどの重い処理をクラウドへ委譲できる。
-- 動作するベースラインをAlphaEvolveに渡し、生成された候補も同じRegistryで扱える。
+初期構成はローカルで動作する。必要になれば学習をVertex AIなどに送ることができる。ベースライン作成後の探索には、Google CloudのAlphaEvolveも使用する。
 
-### 初期の非目標
+この設計の要点は次のとおり。
 
-- Pythonから汎用コーディングエージェント全体を制御する独自フレームワーク
-- 研究フェーズ全体を固定Python状態機械にすること
-- Remote Supervisorによる24/7自律研究、クラウドDB、独自進化的探索アルゴリズム
-- すべてのMLタスクに同じprepare/train/predictメソッドを強制すること
-- 検証スコアの向上だけで本番でのビジネス効果が証明されたと扱うこと
+- 学習や推論の実装方法は固定せず、評価に必要な入力・出力だけを共通化する。
+- 大きく異なる解法はGit worktreeで並行して研究する。実験コードをそのままmainへ統合しない。
+- ハイパーパラメータ、使用データ、評価条件を保存し、結果を再現・比較できるようにする。
+- 研究上の知見は既存のタスク管理ツールtkに残し、個々の実験結果は専用のRegistryで扱う。
+- AlphaEvolveへの接続は専用Adapterに閉じ込める。一般のMLコードをAlphaEvolve独自の形式に合わせない。
 
-## 2. 根拠と設計原則
+この文書に記載するコマンド、設定、ディレクトリ構成は実装予定の案であり、すでに動作するソフトウェアを説明したものではない。
 
-- [CSIRO Image2Biomassの5位解法](https://github.com/Chihiro-n/csiro-biomass-agentic-solution) はClaude Code/Codexによる実装、EXPとchild-expの区別、実験サマリ・失敗の記録を公開している。これを出発点とするが、汚くなりやすい探索コードはmainへ直接入れず、worktreeとPromotionで整理する。
-- [AIDE](https://github.com/wecoai/aideml) の探索木と [MLEvolve](https://github.com/InternScience/MLEvolve) の複数系列・実験メモリを参考とする。ただし、彼らの競技成績は本ハーネスの優位性を実証しない。
-- 実装の責務分割は、このリポジトリの [design-python-code Skill](../../skills-local/.codex/skills/design-python-code/SKILL.md) に従う。名称やパターンから分割せず、状態・不変条件・変更理由から最小構造を選ぶ。
-- 新しい研究Skillは [create-validated-skill](../../skills-local/.codex/skills/create-validated-skill/SKILL.md) を用い、代表タスクの成果、Skillなしとの比較、失敗条件を評価する。
-- 設計提案の根拠と、実装・統合テストで確認した事実を混同しない。
+## 2. 背景と解決したい問題
 
-## 3. 全体アーキテクチャと責務
+通常のコーディングエージェントでも、学習コードを作成して評価結果を読み、次の改善案を提案できる。しかし、長期間のML研究では次の問題が生じる。
+
+まず、実験を繰り返すうちに、どのコード・ハイパーパラメータ・学習データで得たスコアなのか分からなくなる。評価方法を途中で変えた場合には、そもそも実験同士の比較が成立しないこともある。
+
+また、実験用の分岐や暫定処理を既存コードに足し続けると、最良モデルの再利用や本番導入が難しくなる。反対に、試行ごとにコードを整理していては、探索の速度が下がる。
+
+データの問題も重要である。例えば小売の需要予測では、欠品日に記録された販売数量が潜在需要を表していない可能性がある。エージェントが特徴量やモデルだけでなく、データの抽出条件、目的変数、分割方法を見直せる必要がある。ただし、評価セットまで自由に変更すると、改善の判断に使う基準が一定でなくなる。
+
+AlphaEvolveは、動作するプログラムと評価器を前提に、コードの候補を進化的に探索する。ベースラインがない段階の調査・実装まで一貫して任せるためには、別の仕組みが必要になる。
+
+以上から、研究の自由度を保ちながら、実験の比較可能性と完成コードの品質を維持する共通基盤を作る。
+
+### 2.1 想定する利用例
+
+例として、BigQueryに保存された売上・在庫・商品情報から、店舗×SKUの28日需要予測モデルを作る。
+
+1. エージェントが許可されたBigQueryデータセットを調査し、欠品や販売数量の定義を確認する。
+2. エージェントが時系列の検証方法を設計し、評価用データと評価指標を固定する。
+3. LightGBMでベースラインを作り、特徴量、Loss、学習率を変更して複数回評価する。
+4. 別の研究ブランチでTransformerを試し、LightGBMの研究も並行して継続する。
+5. 有望な実験を採用し、必要な実装だけを整理してmainへ統合する。
+6. 完成したベースラインをAlphaEvolveへ渡し、固定した評価指標で追加探索する。
+7. エージェントが最終コード、実験比較表、試した仮説と失敗の理由をまとめたレポートを出力する。
+
+この例に登場するデータやスコアは説明用であり、実際の業務環境を示すものではない。画像分類や推薦など、別のMLタスクも対象にする。
+
+## 3. 要件
+
+### 3.1 機能要件
+
+| ID | 要件 | 完了を確認する方法 |
+| --- | --- | --- |
+| F1 | データの調査・取得SQL・加工方法をエージェントが変更できる | 許可されたBigQuery範囲で2種類の学習データを生成できる |
+| F2 | データセット・分割・ラベル・評価指標を定義して固定できる | 同一Protocolで複数モデルを評価し、変更を検出できる |
+| F3 | 任意の学習・推論方式を試せる | LightGBMと構造の異なるモデルを同じ仕組みで評価できる |
+| F4 | ハイパーパラメータとコード変更を区別して記録できる | 同一コードで異なるパラメータの実験を比較できる |
+| F5 | 複数の解法系列を独立して育てられる | worktreeを分けて並行実験し、履歴を追える |
+| F6 | 検証済みの実験を複数採用し、後からmainへ統合できる | 採用元と統合後の再評価結果を追跡できる |
+| F7 | 途中終了や再試行があっても実行状態を確認できる | 同一ジョブの二重実行を避け、状態を復旧できる |
+| F8 | AlphaEvolveの候補と評価結果を共通Registryへ取り込める | toyプログラムを使って往復を検証できる |
+| F9 | 評価結果・完成コード・研究レポートを生成できる | 数値をRegistryから再取得し、成果物を再生成できる |
+
+### 3.2 品質・運用要件
+
+- ローカルの単一開発者・単一主要writerを初期条件とし、常時稼働するサーバーは要求しない。
+- モデルや学習環境の依存関係をHarness本体へ取り込まない。既存MLプロジェクトの構造を強制的に変更させない。
+- 学習用SQL、学習Snapshot、モデルコード、依存環境、評価Protocolを結果に関連付ける。
+- 評価用の正解ラベルは、必要な範囲で候補コードからアクセスできないようにする。
+- 時間・計算資源・BigQueryの処理量・外部サービス費用に上限を設定できるようにする。
+- 研究上の知見や失敗を消さずに保存する。次のエージェントセッションには必要な部分のみ渡す。
+- 外部サービスのSDKや認証方式が変わっても、実験データモデルの変更を最小限に抑える。
+
+### 3.3 初期対象外
+
+汎用マルチエージェント基盤、独自の進化的探索アルゴリズム、クラウドDB、複数開発者による同時書き込み、エージェントの24時間無人再起動は初期対象外とする。後述するリモート学習の拡張は含めるが、それだけで研究エージェントが無人で動き続けるわけではない。
+
+## 4. 採用する全体構成
+
+研究の進め方はSkillに記述し、実験の正しさを確認できる処理はPythonで実装する。この方式を以下では「Skill主導型」と呼ぶ。
 
 ~~~mermaid
 flowchart TD
-  Agent[Codex / Claude Code] --> Skill[ML Research Skill]
-  Skill --> CLI[mlh CLI]
-  Skill --> tk[tk CLI]
-  CLI --> Core[Experiment Core]
-  Core --> DB[(Local SQLite)]
+  User[利用者] --> Agent[Codex / Claude Code]
+  Agent --> Skill[ML Research Skill]
+  Skill --> CLI[mlh CLI / Python library]
+  Skill --> TK[tk: タスクと研究上の知見]
+  CLI --> Core[実験管理と評価の共通処理]
+  Core --> DB[(ローカルSQLite)]
   Core --> Jobs[Job Backend]
-  Jobs --> Local[Local]
-  Jobs -. optional .-> Remote[Vertex AI / Cloud Run Jobs]
-  Local --> Store[Artifacts]
-  Remote --> Store
-  Core --> Eval[Protected Evaluator]
-  Eval --> DB
+  Jobs --> Local[ローカル実行]
+  Jobs -. 将来 .-> Cloud[Vertex AI / Cloud Run Jobs]
+  Local --> Artifacts[Artifact Storage]
+  Cloud --> Artifacts
+  Core --> Eval[固定Evaluator]
   CLI --> AEAdapter[AlphaEvolve Adapter]
   AEAdapter <--> AE[Google Cloud AlphaEvolve]
   AEAdapter --> Jobs
 ~~~
 
-この図は**呼び出し／データフロー**であり、Pythonのimport依存ではない。
+この図は処理の呼び出し関係を示し、Pythonのimport方向を表すものではない。
 
-| Owner | 責務 | 非責務 |
+### 4.1 コンポーネントと責務
+
+| コンポーネント | 担当する処理 | 担当しない処理 |
 | --- | --- | --- |
-| Agent + Skill | EDA、仮説、コード変更、研究方針、結果解釈、レポート | Registryの整合性、保護された評価処理 |
-| ML Project | SQL、前処理、モデル、推論、固有のArtifact生成 | Run/Attempt状態、共通評価の正本 |
-| Experiment Core | オブジェクトの意味・状態遷移・比較制約・実験記録 | MLモデルのアルゴリズムやGCP SDK |
-| Job Backend | ジョブ投入・状態照会・中止・成果物取得・障害復旧 | モデル選択、採否判断 |
-| Evaluator | 固定Protocolを適用したスコア・妥当性検査 | Candidateの学習と研究方針 |
-| tk | 研究の進捗、decision/finding/blocker/question/hypothesis | 全Runの数値・ジョブログ |
-| AlphaEvolve Adapter | Program/候補、scores/結果、外部ID、Controllerとの対応 | 進化アルゴリズムの自作 |
+| ML Research Skill | 研究計画、EDA、仮説、次の実験、レビュー、レポート | メトリクスの確定、DBの整合性 |
+| コーディングエージェント | SQL・コードの実装、実験の呼び出し、結果解釈 | 固定Evaluatorの改変、認証境界の変更 |
+| ML Project | データ加工、学習、推論、タスクに固有のArtifact生成 | 実験ID・採用状態・評価履歴の管理 |
+| mlh Core | 実験の定義、状態、比較可否、採用判断の記録 | モデル方式の選択、Google Cloud固有API |
+| Job Backend | ジョブの投入、照会、中止、結果回収 | モデルの精度や研究上の価値の判断 |
+| Evaluator | 評価対象・正解・指標に基づく検証済みスコアの算出 | 学習・特徴量生成 |
+| Registry | 実験条件・状態・結果・系譜の永続保存 | 研究上の結論の長期記憶 |
+| tk | 研究タスク、意思決定、発見、未解決問題 | Runごとの数値・学習ログ |
+| AlphaEvolve Adapter | サービス固有のProgram・評価結果とmlhの相互変換 | 進化的探索の実装 |
 
-状態の正本は、Git（コード・branch）、Registry（実験の意味・状態・指標）、Artifact Storage（不変コードBundle・データ・モデル・予測）、tk（研究上の判断）、AlphaEvolve Program DB（サービス上のProgram）に分ける。
+CLIからCoreへ処理を依頼し、Coreは必要なJob BackendやEvaluatorを利用する。CoreのデータモデルにBigQuery、GitHub、AlphaEvolve等のSDK固有型を持ち込まない。実装の組み立ては実行入口の近くで行う。
 
-**Python依存方向**：CLI/adapterがCoreの公開操作を呼ぶ。CoreはクラウドSDK・tk CLIの具体型・例外を知らない。設定、認証、具体Backendの組立てはCLI近くのcomposition rootに置く。
+### 4.2 SkillとPythonを分ける理由
 
-## 4. Data Access PolicyとEvaluation Protocol
+Skillだけであれば、エージェントは研究手順を柔軟に変更できる。しかし、同一実験の二重起動や評価条件の書き換えを、自然言語の指示だけで確実に防げない。
 
-### Data Access Policy
+反対にPythonが研究フェーズ全体を制御すると、データの異常を発見して問題設定を見直す場合にも、制御フローの追加実装が必要になる。
 
-プロジェクト設定に「参照してよいBigQueryのproject/dataset/view・利用するbilling project・location・費用上限」を記述する。クエリ自体は自由に作成・変更できる。
+そこで研究上の判断はエージェントに任せ、実験状態・評価・保存・障害復旧をPython側へ分ける。Skillの数は最初は1つにし、研究・実験・レビュー・統合の手順を必要に応じて参照する。
 
-- 設定だけで権限を保護したことにしない。**読み取り専用サービスアカウントとIAM**で実際のデータ境界を強制する。
-- dry run、maximum bytes billed、タイムアウト等の費用制限を行う。
-- 学習SQLのJOIN、抽出期間、集約粒度、サンプリング、欠品補正などはエージェントが変更できる。
-- SQL本文・パラメータ・参照元・取得日時・スキーマと**データ内容を識別するSnapshot/Digest**を記録する。
-- SQLのハッシュが同じでも、参照データが更新されたら同じSnapshotとはみなさない。
-- 学習データを作り直すだけなら新DatasetSnapshot + Run。モデル側のSQL生成**実装**を変えたなら新Candidateにもなる。
+## 5. 一連の処理例
 
-### 共通Evaluation Protocol
+前述の需要予測モデルを作る場合、次のように動作する。
 
-**評価用のSQLと評価セットも共通化する**。Protocolの識別対象：
+~~~mermaid
+sequenceDiagram
+  participant A as Agent + Skill
+  participant D as BigQuery / Data
+  participant H as mlh
+  participant J as Job Backend
+  participant E as Evaluator
+  participant T as tk
 
-1. 評価対象母集団、観測単位、予測キー
-2. 正解ラベル定義、評価SQLのバージョン
-3. 不変の評価Snapshot（Parquet、BQ Snapshotなど）
-4. 時系列／グループ分割、利用可能時点、CV Fold
-5. 指標・集約方法・最大化/最小化方向
-6. Evaluatorのバージョンと不正出力の扱い
-
-変更したら新Protocol IDを発行し、旧Protocolのスコアとは直接比較しない。新評価系で比較したければ共通ベースラインを再評価する。
-
-学習データはCandidate/Runごとに変更できる。評価期間の説明変数は予測に必要なら使えるが、**評価ラベルおよび最終Holdoutは候補側から隔離**する。研究用Validationを何度も使うことによる過剰適合、欠品に伴うラベルの打ち切り、未来情報リークなどは明示的な検査対象。
-
-## 5. 実行契約：内部自由、評価境界のみ共通
-
-Harnessはprepare/train/predictを固定APIにしない。Candidateに指定した任意コマンドを実行し、必要な成果物を出力してもらう。
-
-- Candidateのコード参照はGit commitまたはContent Digest付き不変コードBundle。
-- Run Specは解決済み設定、学習Snapshot、評価Protocol、seed、実行コマンド、環境・リソースを含む。
-- ML Projectは所定の出力先へArtifact Manifestを保存する。
-- Protocolが必要なArtifactのタイプとスキーマを宣言。表形式予測なら予測キーと予測値、ランキングならクエリごとのスコア、最適化なら目的値・制約充足結果など。すべてを予測Parquetに固定しない。
-- Harnessが形式・キーの重複／欠損・対象の網羅性を確認し、Protected Evaluatorが採否に使う指標を算出する。
-- ML Project自身が出力したメトリクスは参考値とし、Verified Scoreの正本にはしない。
-
-### Run Spec（例・未確定の提案Schema）
-
-~~~yaml
-candidate_id: cand_lgbm_007
-request_id: client-request-123
-campaign_id: campaign_hpo_01
-resolved_config:
-  learning_rate: 0.05
-  num_leaves: 63
-  objective: regression_l1
-  early_stopping_rounds: 50
-  features: [price_lag, stock]
-seed: 42
-train_dataset_id: train_v4
-evaluation_protocol_id: temporal_cv_v2
-execution:
-  backend: local
-  command: ["uv", "run", "python", "-m", "demand_forecast.train", "--config", "run.yaml"]
-  timeout_seconds: 3600
+  A->>D: 許可範囲を調査、SQLを作成
+  D-->>A: 学習データ・データ品質
+  A->>H: 評価ProtocolとSnapshotを登録
+  A->>A: モデルを実装、Candidateを保存
+  A->>H: CandidateとRun設定を登録
+  H->>J: ジョブ投入
+  J-->>H: Artifactと実行結果
+  H->>E: 固定した評価条件で採点
+  E-->>H: 検証結果
+  H-->>A: Runの指標・比較
+  A->>T: 必要な知見・判断だけ記録
+  A->>A: 次の実験または統合を選択
 ~~~
 
-実行前に、**デフォルトを含む全ハイパーパラメータと設定値を解決して不変保存**する。コード変更がない限りHPO値の違いはRunの違いとする。
+研究途中で欠品に由来するデータの偏りが見つかれば、エージェントは学習データの生成方法や評価設計を再検討してよい。評価設計を変更した場合は新しいEvaluation Protocolを登録し、変更前の数値との直接比較を行わない。
 
-## 6. Registryのデータモデル
+## 6. データ取得と評価方法
 
-| Entity | 定義 | IDが変わる条件 |
+### 6.1 データ取得の範囲
+
+データの利用範囲はML Projectごとに定義する。例えばBigQueryのsales、inventory、productsという3つのデータセットを参照可能とし、SQLの内容はエージェントが決める。
+
+~~~yaml
+data_access:
+  provider: bigquery
+  billing_project: example-ml-research
+  location: asia-northeast1
+  allowed_datasets:
+    - example-retail.sales
+    - example-retail.inventory
+    - example-retail.products
+  max_bytes_billed: 10000000000
+~~~
+
+上記は架空の設定例である。許可範囲の宣言だけではアクセス制御にならない。実際には読み取り専用のIAM権限、実行主体の認証、クエリ費用上限を設ける。
+
+学習データの抽出期間、JOIN、集計粒度、欠品補正、サンプリングは変更してよい。実行SQLとパラメータ、参照テーブル、スキーマ、取得時点、保存したデータの識別情報を記録する。同じSQLでも元テーブルが更新されれば結果が変わるため、SQL文字列だけをデータの識別子にはしない。
+
+### 6.2 Evaluation Protocol
+
+Evaluation Protocolは、モデル同士を比較する際の共通条件をまとめた定義である。
+
+固定する項目は評価対象の母集団・予測キー、正解ラベル、評価用SQLとSnapshot、学習・検証の分割規則、利用可能な特徴量の時点、評価指標と集計方法、Evaluatorのバージョンとする。
+
+学習データはCandidateやRunごとに変更してよい。ただし、評価データの正解ラベルを学習側へ渡してはならない。特に最終Holdoutは、反復的なモデル選択に利用するValidationと分ける。
+
+評価Protocolの内容が変わった場合は新IDを発行する。異なるProtocolで得たスコアを同列に比較しない。必要なら、既存のベースラインを新しいProtocolで再評価する。
+
+### 6.3 共通の実行・出力形式
+
+Harnessはモデル固有のprepare、train、predictというメソッドの実装を要求しない。Run Specが実行するコマンド・入力・設定・出力先を指定し、ML Projectが評価に必要なArtifactを生成する。
+
+評価に必要なArtifactの種類はProtocol側が指定する。例えば需要予測では予測キーと予測数量の表、推薦では対象ユーザーと候補商品のスコア、最適化では目的値と制約充足の結果などを想定する。
+
+候補モデルのコードから出力したスコアは参考値として保存できるが、採用判断に使う検証済みスコアは独立したEvaluatorが計算する。
+
+~~~yaml
+run:
+  candidate_id: candidate-lgbm-02
+  train_dataset_id: dataset-train-03
+  evaluation_protocol_id: forecast-cv-01
+  seed: 42
+  parameters:
+    learning_rate: 0.05
+    num_leaves: 63
+    objective: regression_l1
+  execution:
+    backend: local
+    command: ["uv", "run", "python", "-m", "forecast.train"]
+    timeout_seconds: 3600
+~~~
+
+このRun Specは形式の例であり、正式なJSON Schemaは実装時に確定する。デフォルト値を含めて全設定を実行前に確定し、保存する。
+
+## 7. 実験を管理する概念
+
+実験をコードの変更と実行条件の変更に分けて追跡する。
+
+| 単位 | 意味 | 例 |
 | --- | --- | --- |
-| Approach | アルゴリズム体系、学習・推論フロー、学習問題の構成方式が一貫する研究系列 | 解法体系または主要な処理構造が変わる |
-| Candidate | コードと設定スキーマの不変Snapshot | 実装コード・設定スキーマ等を変更 |
-| Run | Candidateに具体的ハイパラ・学習Snapshot・seed・Protocolを与えた**一つの論理評価** | 確定パラメータ、データ、seed、評価条件等が変わる |
-| Attempt | 一つのRunを実行した物理的な試行 | Retry、失敗回復などの再実行 |
-| SearchCampaign | Codex、Optuna、AlphaEvolve等の探索目標・予算・方式を束ねる | 新たな探索活動開始 |
-| Acceptance | Verified Runを採用した理由と適用範囲 | 採否・判断根拠の登録 |
-| Promotion | Accepted Run由来のコードをmainに統合する活動 | 統合作業開始 |
-| DatasetSnapshot | 物理データ内容と取得条件の不変参照 | 取得結果が変わる |
-| EvaluationProtocol | 共通評価条件の不変参照 | 比較条件が変わる |
+| Approach | 独立して改善する解法の系列 | LightGBMの直接予測、Transformerの時系列予測 |
+| Candidate | コードと設定項目が固定された実装 | 価格・在庫特徴量を追加したLightGBMのコード |
+| Run | Candidateと具体的な設定・データ・評価条件を組み合わせた一つの評価 | learning_rate=0.05、seed=42、5-fold CV |
+| Attempt | Runを実際に起動した1回分の処理 | 正常終了、タイムアウト、障害後の再試行 |
+| SearchCampaign | ひとまとまりの探索活動 | OptunaのStudy、AlphaEvolveの探索、Codexの改善試行 |
 
-- **Approach → Candidate → Run → Attempt**が基本系譜。SearchCampaignとAcceptanceは別の参照関係であり、無理に階層へ入れない。
-- Candidateはコード参照種別をGitかArtifactにできる。AlphaEvolveの全Programへcommitやworktreeを作成しない。
-- 1 Run = 5 Fold CVなど完結した一評価。Fold値はRunの結果。Optunaの各Trialは基本別Run。
-- 同じRunの障害復旧は別Attempt。意図的に同条件で再現性を測る実験は別Runにし、関連元を記録する。
-- Runは作成後に設定・データ・Protocolを変更しない。verified後の結果も上書きしない。
-- AcceptはCandidateではなく**Run**。ハイパラまで採用対象に含まれる。異なるRunを複数Acceptedにできる。
+Approach、Candidate、Run、Attemptは親子関係を持つ。SearchCampaignは複数CandidateとRunを横断してまとめるため、別の参照として扱う。
 
-想定SQLiteテーブル：approaches、research_branches、candidates、runs、attempts、campaigns、acceptances、promotions、datasets、protocols。確定設定・metrics等はJSON列でもよい。重複受付の排除にはRun仕様Digestと**リクエストの冪等キー**を区別し、同設定を意図して別Runとして評価する操作も可能にする。
+### 7.1 CandidateとRunの境界
 
-### 状態
+コードを変更したときは新Candidate。例えば新しい特徴量生成処理やカスタムLossを実装すれば、実装が変わる。
 
-- Approach：active / paused / archived
-- Candidate：不変Snapshotであり、採否を状態に混ぜない
-- Run：created → running → verifying → verified / invalid / failed。外部実行との同期が失われたらunknown
-- Attempt：submitted / running / succeeded / failed / timed_out / unknown
-- Acceptance：対象Run、理由、スコープ、採用／撤回履歴
-- Promotion：prepared / verifying / ready / merged / abandoned
+一方、学習率、木の深さ、Lossの選択、特徴量の有効・無効、seedなどを既存の設定項目で切り替える場合は、同じCandidateの新Runとする。Lossの変更だけを理由にApproachは分けない。
 
-状態の書換えと許可遷移はCoreのowner。クラウドジョブ・Git・tk等の直接書込み経路で不正状態を作れないようにする。
+学習データのSQLだけを変更して新しいSnapshotを生成した場合、モデルコードが同じなら新Runで比較できる。SQL生成処理をモデルのコードに組み込んでいて、その実装を変更した場合は新Candidateになる。
 
-## 7. Git / worktree / Accept / Promote
+1つのRunは、指定した条件による完結した評価を表す。5-fold CVなら5回の学習をまとめて1 Runとし、foldごとの指標はその結果に含める。Optunaの各Trialは通常それぞれ新Runになる。
 
-### 新Approachとworktreeを作る判定
+### 7.2 実験の記録と状態
 
-**新Approach**は次のいずれかを満たす場合：
+RegistryはローカルSQLiteを初期実装に使用する。Approach、Candidate、Run、Attempt、SearchCampaign、Acceptance、Promotion、DatasetSnapshot、EvaluationProtocolを保存する。
 
-1. 学習アルゴリズム体系が違う（LightGBM→Transformer、ALS→Two-Towerなど）
-2. 学習・推論ステージの主要構造が変わる（単一→二段階、直接→再帰予測、スタッキング）
-3. 学習問題の構成方法が本質的に変わる（単純売上回帰→別段階で潜在需要を推定等）
+Candidateは不変のコードSnapshotとして保存する。Git commitか、Content Digest付きのコードBundleで参照する。研究ブランチの現在のHEADを使って実行中のCandidateが変わることは許さない。
 
-探索パラメータ数が増えるだけでは新Approachにしない。Lossの選択やハイパラはRun。**新たなLoss・特徴量実装**は同Approachの新Candidate。SQLパラメータ変更は通常新DatasetSnapshotとRun。
+Runの確定パラメータ、データ、評価Protocolは実行後に変更しない。verifiedとなったスコアも上書きせず、再評価が必要なら新Runを作る。
 
-**worktreeはApproachと1対1に固定しない。** 新Approachなら原則別worktree。同Approachでも、相反するコード変更を並行かつ継続的に育てる場合のみ派生worktree。単発の大規模変更を試すなら一時spike worktreeも許容。不要になればworktreeは削除できるが、必要なCandidateのコード参照とArtifactは保持する。
+Runの大まかな状態はcreated、running、verifying、verified、invalid、failedとする。実行先の状態を確認できない場合はunknownとして扱い、照合するまで成功・失敗を決めない。
 
-| 例 | Approach | Candidate | Run | worktree |
-| --- | --- | --- | --- | --- |
-| 学習率やLoss設定を変更 | 維持 | 維持 | 新規 | 不要 |
-| 新特徴量・カスタムLossを実装 | 維持 | 新規 | 新規 | 原則不要 |
-| 学習SQLの期間や対象を設定変更 | 維持 | 維持 | 新規 | 不要 |
-| LightGBM→CatBoost/Transformer | 新規 | 新規 | 新規 | 新規 |
-| 単一予測→二段階予測 | 新規 | 新規 | 新規 | 新規 |
-| 同一Approachの競合する実装を並行育成 | 維持 | 別系列 | 別系列 | 派生 |
-| AlphaEvolveが多数Program生成 | 通常維持 | 各ProgramをCandidate化 | 各評価Run | Programごとには不要 |
+AttemptにはジョブID、開始・終了時刻、実行環境、終了状態を残す。障害回復による再試行は同じRunの別Attemptとし、結果のばらつきを測る独立実験は新Runとする。
 
-Candidateのparent_candidate_idは研究上の親子関係。Git commitの親子関係と完全同一である必要はない。研究branchは長期保持してよく、Accepted Runがbranch HEADである必要もない。
+### 7.3 検証・採用・統合
 
-### Verified / Accepted / Promoted
+研究上の意思決定を次の3段階に分ける。
 
-- **Verified**：Evaluatorが固定Protocolで結果を確認した。
-- **Accepted**：研究系列の有望なRunとして採用した。複数同時可。別系列を終了させない。
-- **Promoted**：mainからintegration branchを作り、採用元のコードと**採用したRun設定**を必要な形に整理、設計Skillでリファクタリング、再評価、テスト、PR経由でmergeした。
+| 段階 | 意味 |
+| --- | --- |
+| Verified | 固定したProtocolでRunを評価できた |
+| Accepted | 有望なRunとして研究系列で採用した |
+| Promoted | 採用元の内容を整理・再評価したコードがmainへ統合された |
 
-Promotion後のコードは元のCandidateと異なる可能性があるため、新Candidate＋新Runとして再評価し、元Accepted Runとの比較を記録する。mainは最高スコアの実験コードを置く場ではなく、保守可能な検証済み実装を置く場とする。
+Acceptの対象はCandidateだけでなくRunとする。採用したハイパーパラメータや学習データも特定するためである。複数ApproachのRunを同時にAcceptedにでき、未採用の研究を停止する必要もない。
 
-## 8. ローカルControl PlaneとRemote Job Backend
+Promote時にはmainから統合用ブランチを作り、必要な実装だけを持ち込む。設計Skillに従ってコードを整理し、統合後のコードを新Candidateとして再評価する。元のAccepted Run、統合後Run、PRとmerge commitを関連付ける。実験ブランチをそのままmainへmergeすることは標準手順にしない。
 
-初期は**ローカルSQLite＋ローカルJob Backend**。モデル・予測・データ等の大きなArtifactはローカルFilesystemを基本とし、必要に応じてGCS URIを使う。リモートの学習プロセスはRegistryへ直接書かない。
+## 8. Git branchとworktreeの使い分け
 
-具体的なLocal／Vertex AI等の交換が想定されているので、次の最小契約にする。
+worktreeは独立した作業ディレクトリであり、CandidateやRunそのものではない。1つの研究ブランチには複数のCandidateを保存できる。
+
+新しいApproachとするのは、次のいずれかが変わる場合である。
+
+- 学習アルゴリズムの体系が変わる。例：LightGBMからTransformerへ切り替える。
+- 学習・推論の主要な段階が変わる。例：単一予測モデルから二段階予測へ変更する。
+- 学習問題を構成する方式が本質的に変わる。例：売上回帰とは別に潜在需要を推定する段階を追加する。
+
+探索するパラメータの数が増えても、それだけでは新Approachにしない。新特徴量や新Lossの実装は原則同じApproachの新Candidateとする。
+
+worktreeを新設するのは、新Approachを始める場合、または同じApproach内で互いに競合するコード変更を並行して継続する場合とする。短い試行には一時的なworktreeを使ってもよい。
+
+~~~text
+main
+├── approach/lgbm
+│   ├── Candidate L1 → Run 1, Run 2
+│   ├── Candidate L2 → Run 3
+│   └── variant/lgbm-alt-features
+│       └── Candidate L3 → Run 4
+└── approach/transformer
+    └── Candidate T1 → Run 5, Run 6
+~~~
+
+この図は研究系列の例であり、Gitの実際のディレクトリ構成ではない。worktreeの削除後も、採用に必要なcommitやコードBundleと実験Artifactは保持する。AlphaEvolveが作る大量のProgramには、それぞれ専用worktreeを作らない。
+
+## 9. AlphaEvolveとの接続
+
+AlphaEvolveはGoogle Cloudが提供する進化的なコード探索サービスであり、動作するSeed Programと評価関数を必要とする。一般的なコーディングエージェントの代わりに、自然言語だけからベースラインを作る用途には使用しない。
+
+最初のバージョンからAlphaEvolve Adapterを実装対象とする。ただし、サービスとの接続で問題が判明した場合はAdapterの構造を変更する。
+
+### 9.1 接続方法
+
+Google公式のPythonクライアントが提供するControllerを利用し、候補Programの取得、評価、スコアの返却を行う。Harnessは次の変換を担当する。
+
+| AlphaEvolve | Harness |
+| --- | --- |
+| Experiment | SearchCampaign |
+| Program | Candidate（コードBundle参照） |
+| Program Evaluation | Run |
+| 評価ジョブの試行 | Attempt |
+| Scores / Insights | 評価指標・診断情報 |
+
+動作するベースラインからSeed Programを準備し、変更可能なコード範囲を指定する。生成されたProgramを不変のCandidateとして保存し、共通Evaluatorで評価する。小さいほどよいWMAPEなどの指標は、AlphaEvolveが使用する最大化方向へAdapter内で変換する。
+
+AlphaEvolveがハイパーパラメータをコードに直接書き込んだ場合は新Candidateになる。外部設定だけを変えた場合は同じCandidateの別Runにできる。
+
+公式サービスが持つProgram DBの内容を、Gitへ1件ずつ複製しない。有望候補を選んだときに、必要ならGit研究ブランチへ取り込む。
+
+### 9.2 Controllerの運用
+
+初期はローカルControllerを使用する。候補生成はGoogle Cloud側で行われるが、評価結果を返すControllerは起動している必要がある。ローカルPCが停止すると、反復的な評価が継続できない場合がある。
+
+完全な無人探索が必要になったら、Controllerもリモート環境へ移す。これは個別の学習ジョブをリモートへ送る機能とは別の拡張である。
+
+Google Cloudの利用権限がない環境では、Mockを使ったAdapterテストと実サービスとの接続確認を区別する。Mockの成功だけでlive接続済みとはしない。
+
+## 10. ローカル実行とリモート実行
+
+初期の操作とRegistryの管理はローカルで行う。重い学習・予測・評価はJob Backendを通して別環境へ送れるようにする。
 
 ~~~python
 class JobBackend(Protocol):
@@ -237,193 +341,183 @@ class JobBackend(Protocol):
     def collect(self, handle: JobHandle) -> ArtifactManifest: ...
 ~~~
 
-JobSpecにはRun ID、Candidate・コード・設定・Datasetの不変参照、環境、リソース、timeout、入出力URI、再送識別子を含む。JobHandleには外部job IDとbackendを保持する。Local実装には標準ライブラリやInvoke等を適切に使えるが、公開APIは特定ライブラリに固定しない。
+これは必要な操作を示す概念インターフェースで、実装時に戻り値やエラー処理を確定する。最初はLocal Backendを実装し、用途に応じてVertex AI Custom JobsやCloud Run Jobsを追加する。ローカルのコマンド実行にはsubprocessやInvoke等を選べるが、外部APIをそのライブラリに依存させない。
 
-Remote Jobの運用：
-1. Run/Attemptを先に永続登録してから投入
-2. 外部job IDをRegistryに記録し、cloud jobのラベル等からも再発見可能にする
-3. PCを停止してもremote training自体は継続できる
-4. 再開したらsyncで状態を照合し、ArtifactをcollectしてEvaluatorで確認
-5. 結果不明の実行を安易に再送せず、重複ジョブを防ぐ
-6. 実行環境（GPU、ライブラリ等）をAttemptにも記録。別環境での独立再現評価なら新Runとする
+### 10.1 非同期ジョブの復旧
 
-初期はLocal Backend必須。Remote Backendは最初の実運用先に応じてVertex AI Custom JobsまたはCloud Run Jobsを追加する。**Remote Jobを持つことと、研究エージェントをクラウドで常時回すC2化は別**。
+リモートへ投入するときは先にRun/AttemptをRegistryへ登録し、返された外部ジョブIDを保存する。同じIDをクラウドジョブのラベル等にも付け、ローカル側の保存が途中で失敗しても再発見できるようにする。
 
-## 9. AlphaEvolve Adapter（初期実装対象）
+ジョブが完了したら、ローカル側が状態とArtifactを取得し、Evaluatorによる検証を終えてからRunをverifiedにする。PC停止中にリモート学習が完了した場合にも、再開後のsyncで追跡できるようにする。
 
-公式AlphaEvolveは、管理された候補生成・Program DB・探索サービスと、利用者側のEvaluator/Controllerからなる。**単一の非同期学習ジョブを投げて完成結果を待つだけのサービスではない**。公式のPythonクライアントが提供するController（run_controller_loop等）を利用する。[公式リポジトリ](https://github.com/Google-Cloud-AI/alphaevolve-on-googlecloud)、[アーキテクチャ](https://docs.cloud.google.com/gemini/enterprise/docs/alphaevolve/developer-guide/architecture-and-workflows)。
+同じ要求の再送でジョブが二重起動しないようにする。一方、同じ条件を使った独立の再現実験は別Runとして明示的に作成できるようにする。
 
-初期Adapterの責務：
-1. 実行可能なAccepted RunからSeed Programを作り、進化対象コード範囲を用意する。
-2. SearchCampaignを作り、AlphaEvolve experiment ID・seed・評価Protocolを関連付ける。
-3. Programを受け取って不変コードBundleとして保存し、Candidate IDを付ける。
-4. 共通のJob Backend/Protected Evaluatorで評価し、Run/Attemptを保存する。
-5. 指標の最大化方向変換、AlphaEvolve固有のscores/insights作成・送信を行う。
-6. 外部Program ID・親子関係・エラーを保存し、有望候補をGit研究branchに取り込めるようにする。
+初期のSQLiteは単一主要writerで利用する。複数の独立したエージェントが別マシンから同時に書き込む必要が出たら、クラウドRegistryを検討する。
 
-| AlphaEvolve側 | Harness側 |
-| --- | --- |
-| Experiment | SearchCampaign |
-| Program | Candidate（artifact source） |
-| Evaluation | Run |
-| 評価ワーカー実行試行 | Attempt |
-| Scores / insights | Verified Metrics / Diagnostics |
+## 11. tkとエージェントへの情報の引き継ぎ
 
-AlphaEvolveがパラメータをコードに書き込んだ場合は新Candidate。独立設定だけ変えるHPOの場合は別Run。ProgramごとにGit commit・worktreeを要求しない。外部サービスのProgram DBとローカルRegistryは外部IDとContent Digestで関連付ける。
+[tk / tasukura](https://github.com/mixidota2/tasukura) は、コーディングエージェント向けのローカルタスク管理CLIである。タスクの進捗をprogress_logsに保存し、後から参照すべき判断や発見をtyped recordsとして管理できる。
 
-初期はローカルController。PC停止中も**探索の連続評価まで**行いたければControllerもクラウドに移設する必要がある。生成はクラウド、評価場所はローカルでもリモートでもよい。[公式Evaluatorパターン](https://docs.cloud.google.com/gemini/enterprise/docs/alphaevolve/developer-guide/evaluator-patterns)。
+ML Research Harnessでは、研究の進捗・発見・未解決仮説をtkへ記録する。個々の学習実行やスコアはRegistryで扱うため、全Runをtkのタスクにする必要はない。
 
-公式Skillが検証する範囲と、MLコード全体を自由に作る一般エージェントの範囲を混同しない。必要なGoogle Cloud契約・IAMが使えない時点では、Mock/tiny evaluatorを通しても**live統合未検証**と明示する。APIの変更があればこのAdapterだけを修正し、Coreへサービス固有の型を漏らさない。
+新しいエージェントセッションでは、研究目的、現在の評価Protocol、有効なtkの知見、最良のVerified/Accepted Run、関連する失敗、次の実験、残り予算をまとめて渡す。学習ログ全文を毎回コンテキストに含めず、必要になったときにRun IDから取得する。
 
-## 10. tkとエージェント向けContext
+例えば「価格ラグを加えても改善しなかった」という結果はRunに残す。「欠品日に販売数量が需要を過小評価する可能性がある」という研究上の仮説は、検証状況を添えてtkに残す。仮説が否定された場合はtkの既存の履歴管理機能を使って更新する。
 
-- tk：研究タスク、長期の決定・知見・未解決問題。既存のprogress_logs→typed records昇格ルールを維持。
-- Registry：全Candidate/Run/Attempt、スコア、失敗、派生、Artifact参照。
-- Context Builderは、プロジェクト目標、固定Protocol、tkの有効な記録、Verified/Accepted Run、直近の関連実験、次アクション、残り予算をコンパクトに集める。
-- 全ログや全実験コードを毎回コンテキストに入れない。実験IDから元Artifact、tk Record IDから元ログへドリルダウンする。
-- 全RunをtkのタスクやRecordにしない。検証済みの重要な知見だけを進捗ログからRecordへ昇格させる。
-- エージェントの自己申告よりRegistryの検証済み状態を優先する。
+## 12. 配布方法とPythonコードの構成
 
-## 11. 配布と実装treeの暫定案
-
-Skill・プラグイン設定とPython CLIを**一つの実装リポジトリ**でバージョン管理する。各MLプロジェクトへハーネス一式をコピーするテンプレート方式は主軸にしない。新規プロジェクトの初期化用テンプレートは後から追加できる。
+SkillとPython CLIは同じ実装リポジトリで管理する。ただしPythonツールはSkillがなくてもテスト・実行できる構成とする。エージェント固有のプラグイン設定は配布先に応じて用意する。
 
 ~~~text
-ml-research/                        # 将来作成する実装リポジトリ（まだ存在しない）
+ml-research/
 ├── pyproject.toml
 ├── AGENTS.md
-├── skills/ml-research/
-│   ├── SKILL.md
-│   └── references/
-│       ├── research.md
-│       ├── experimentation.md
-│       ├── branching.md
-│       ├── promotion.md
-│       └── reporting.md
-├── src/mlh/
-│   ├── cli.py
-│   ├── experiments/              # Candidate/Run/Acceptの意味
-│   ├── execution/                # Runner、JobBackend、Attempt
-│   ├── evaluation/               # EvaluationProtocolと共通評価
-│   ├── data/                     # DatasetSnapshotと権限境界
-│   ├── git/                      # research branch / worktree
-│   ├── alphaevolve/              # 外部ProgramのAdapter
-│   └── context.py                # tkとRegistryの選択的参照
+├── skills/
+│   └── ml-research/
+│       ├── SKILL.md
+│       └── references/
+│           ├── research.md
+│           ├── experimentation.md
+│           ├── branching.md
+│           ├── promotion.md
+│           └── reporting.md
+├── src/
+│   └── mlh/
+│       ├── cli.py
+│       ├── experiments/   # 候補・Run・採用状態
+│       ├── evaluation/    # Protocolと評価検証
+│       ├── execution/     # ジョブ投入・結果回収
+│       ├── data/          # データSnapshotの管理
+│       ├── git/           # branch/worktreeの操作
+│       ├── alphaevolve/   # Google Cloud専用Adapter
+│       └── context.py
 ├── tests/
-├── examples/toy_forecasting/
-└── docs/design.md
+├── examples/
+│   └── toy_forecasting/
+└── docs/
+    └── design.md
 ~~~
 
-このtreeは固定テンプレートではない。最初はflat moduleでよく、状態・変更理由・依存境界が実際に独立した箇所だけsubpackageに昇格する。既存のML Projectのディレクトリ構造は強制的に変更させない。Pythonプロジェクトがuvを使っているならuvを維持する。
+上記は責務の配置例である。実装が小さいうちはファイルを平坦に置き、独立した変更理由が生じたときにサブパッケージへ分けてよい。
 
-想定CLI（全て**提案名／未実装**）：
+個々のML Projectは既存のディレクトリ構成を維持する。モデル固有の学習・推論・前処理は、実際の変更単位に沿って同じ場所へ置く。例えばLightGBM固有の特徴量生成と学習処理は同じApproach内にまとめ、共通化する根拠が確認できたコードだけを外へ移す。
 
-| 操作 | 目的 |
+この配置方針は [design-python-code](../../skills-local/.codex/skills/design-python-code/SKILL.md) に従う。
+
+### 12.1 CLIの候補
+
+| 操作 | 役割 |
 | --- | --- |
-| mlh init | Project導入 |
-| mlh approach create / branch create | 新研究系列・研究worktree |
-| mlh candidate capture | 不変コードSnapshot登録 |
-| mlh run submit / status / sync / wait / collect | 実行と状態照合 |
-| mlh compare | 同じProtocolの実験比較 |
-| mlh accept | Verified Runを理由付きで採用 |
-| mlh promote prepare | mainから統合branchを準備 |
-| mlh context | 次セッション向けContext |
-| mlh alphaevolve start / status / collect | 公式Controllerの利用と結果取り込み |
+| mlh init | 既存ML Projectへ設定を追加する |
+| mlh candidate capture | 実装を不変Candidateとして保存する |
+| mlh run submit / status / sync / collect | Runの実行、状態照会、結果回収 |
+| mlh compare | 比較可能なRunの評価結果を集計する |
+| mlh approach create / branch create | 新しい研究系列やworktreeを作る |
+| mlh accept | Verified Runを理由付きで採用する |
+| mlh promote prepare | mainへの統合作業を準備する |
+| mlh context | 次のエージェントセッションへ渡す情報を作る |
+| mlh alphaevolve start / status / collect | AlphaEvolveの探索と結果の取り込み |
 
-## 12. 実装順序と受け入れテスト
+コマンド名、引数、JSON Schema、例外形式は実装時に確定する。CLIから同じPythonの処理を呼ぶ形にし、将来NotebookやAPIが必要になってもMLロジックを複製しない。
 
-### Phase 0：実行契約のPoC
-Toy forecastingでCandidate → 2種類のHPO Run → Attempt → 固定Evaluator → Registry → 比較結果をローカル完走。再現不能なCandidate、Protocol違反、重複キーを拒否する。
+## 13. セキュリティ、費用、障害への対処
 
-### Phase 1：Kaggle型の研究運用
-Skill、tk、データアクセスの設定、Approachとworktree、複数Accepted Run、Promotion、レポート生成を実装。新SkillはSkillあり・なしの比較を行う。
+### 13.1 データと権限
 
-### Phase 2：AlphaEvolve Adapter（初期版の要件）
-Toy Seedと公式Controllerを使い、Program → Candidate → Run → scores/insights → 有望候補取り込みを確認。Google Cloud権限が使えない場合はMock PassとLive未検証を区別する。
+データアクセスは許可されたデータセットに限定する。学習コードを実行する認証情報から、保護された評価用の正解ラベルへアクセスできないようにする。資格情報をGit、実験ログ、Artifactに保存しない。SQLを自由に変更できることを、アクセス権限まで自由であることと混同しない。
 
-### Phase 3：最初のRemote Job Backend
-実際の要件に応じてVertex AI Custom Jobs等を一つ実装。投入直後のローカル異常終了、リモート完了後のローカル停止、二重送信、成果物欠落をテストする。
+### 13.2 計算費用
 
-**受け入れシナリオ**：
+実験数、時間、CPU/GPU、BigQuery処理量、AlphaEvolveのAPI利用量に予算上限を設定する。外部サービスの費用が取得できない場合は推定と実測を区別する。予算超過時に新しいジョブを投入しない。
 
-1. 同じCandidateのHPO値を変えてもRunだけ増え、同じCandidateのコードは増殖しない。
-2. 新しいカスタムLossは同Approachの新Candidate、Transformerへの変更は新Approachとなる。
-3. 2つのworktreeを並行に育て、親Candidateの系譜とRun結果を独立保持できる。
-4. 複数RunをAcceptしても別系列を終了させない。
-5. 同一リクエストの再送は重複ジョブを生まず、意図的な再現実験は別Runになる。
-6. Protocol違反、評価データリーク、予測キー欠落等を無条件でverified扱いしない。
-7. Promotionでは整理後コードを新Candidateとして同条件で再評価し、採用元Runとの対応を残す。
-8. AlphaEvolve Programを不変コードBundleとして保存し、共通EvaluatorのRunを返せる。
-9. リモートジョブの状態はPC停止後もsyncで再発見・検証できる。
-10. 完成コード、任意形式の評価Artifacts、失敗含む研究レポートが納品できる。
+### 13.3 障害・不整合
 
-## 13. 残る未決事項とリスク
+| 事象 | 必要な動作 |
+| --- | --- |
+| 同一Runの投入要求が重複 | 冪等キーで確認し、意図しない二重起動を防ぐ |
+| リモート投入後にローカルが停止 | 外部ジョブIDやラベルから照合し、状態を復旧する |
+| 学習が完了しても予測Artifactが欠けている | verifiedにせず、失敗の理由を残す |
+| 評価Protocolが変わった | 旧スコアとの比較を拒否する |
+| コードやデータの参照先が失われた | 再現可能と表示せず、保存・保持方式を修正する |
+| AlphaEvolveのAPIや権限が使えない | Adapterを原因付きで失敗扱いし、通常の研究機能は利用可能にする |
 
-以下は設計を先送りしたことを明記し、**実装済みと扱わない**。
+## 14. 検討した代替案
 
-1. Artifact Manifestのスキーマ：表形式予測以外への一般化、キー・欠損・重複判定
-2. Evaluation Protocolの凍結操作、最終Holdoutの隔離方法、承認権限
-3. Snapshotの物理形式・retention・GCSコスト・PIIの取り扱い
-4. Remote Jobの冪等性、timeout・partial success・orphan Job再発見の実装
-5. AlphaEvolveのSDK/API、契約・IAM、live Controllerと評価コードの連携確認
-6. Codex/Claude Codeプラグイン配布仕様と共通Skillの移植性
-7. BigQueryの権限と実行費用上限、実際のデータドメインの妥当性
-8. 多量のCandidate Bundleをいつ削除してよいかのGC・参照保持
-
-**設計時点で採用しない代替案**：
-- Python主体の研究Supervisor：既存エージェントの研究能力と役割が重複しやすい。無人常時実行が必要になればC2として追加。
-- 研究コードを1本のmainに積み重ねる：コード肥大化と元実験の追跡困難を招く。
-- 1実験1worktree：維持コストが大きい。
-- 固定train/predict関数API：大きく異なる手法への拡張を阻害する。
-- クラウドDB：最初は単一主要writerのローカルSQLiteで十分。複数writerの必要性が出たら再検討。
-- テンプレートリポジトリ主軸：既存Projectへ更新を反映しにくい。
-
-## 14. 設計セルフレビュー（実装前の暫定）
-
-[design-validation](../../skills-local/.codex/skills/design-python-code/references/design-validation.md) の10観点。**Passは文書上のシナリオに対する評価であり、実装済みを意味しない。**
-
-| 観点 | 判定 | 理由／未確認 |
+| 代替案 | 今回採用しなかった理由 | 再検討する条件 |
 | --- | --- | --- |
-| Coverage | Pass（文書範囲） | 研究開始から完成物までownerを配置 |
-| Ownership | Pass（提案上） | Git、Registry、tk、Artifacts、AEの正本を分離 |
-| Cohesion | Pass（提案上） | 研究判断、実行、評価、外部接続を分離 |
-| Dependency | Revise（未実装） | 実際のimport・環境初期化・SDK漏出は未検証 |
-| Abstraction necessity | Pass（提案上） | 実在するLocal/Remote、AE接続のみを先取り |
-| Orchestration | Revise（未実装） | cloud投入のpartial success、transaction、重複回避を要確認 |
-| Changeability | Pass（設計シナリオ） | HPO、新手法、Dataset、Remote、Promotionを分離 |
-| Cognitive load | Revise（未実装） | CLIからの実際のcall traceで確認 |
-| Evidence | Revise（未確認） | 公開事例と明示要件は確認。SDK・実行境界は実証が必要 |
-| Simplicity | Pass（提案上） | 研究Supervisor、クラウドDB、複雑なPlugin Registryを保留 |
+| Skillだけで実験を管理する | 評価の固定や二重実行防止を自然言語の指示だけでは保証できない | 使い捨ての小規模PoC |
+| Python製Supervisorが研究の順序を制御する | 既存のコーディングエージェントの計画・実装機能と重複する | 無人でセッションを跨ぐ研究継続が必要になったとき |
+| train/predictの固定関数API | 二段階・再帰・アンサンブルなど異なる構成を試しにくい | 対象が特定のMLパイプラインへ絞られたとき |
+| 1実験につき1worktree | パラメータ実験まで作業ディレクトリが増える | 実験ごとの完全隔離が必要な短期用途 |
+| 実験コードをそのままmainへ統合する | 暫定処理や使わない分岐が残りやすい | 単純な既存コード修正 |
+| 初期からクラウドRegistryを使う | 単一開発者のローカル運用では認証・運用が増える | 複数writerや共同研究が必要になったとき |
+| テンプレートリポジトリを主な配布手段にする | 既存ML ProjectへHarnessの更新を反映しにくい | 新規Projectの共通構造が安定したとき |
 
-**境界の反証（Merge/Delete）**：
-- Core状態とSQLite保存を完全統合すると、不変条件の責務と保存方式の変更が結び付く。境界は維持。ただし初期は小さなモジュールでよい。
-- JobBackendを削除すると、Local→Vertex移行がCLIやRun管理へ波及。残す。
-- AlphaEvolve AdapterをCoreへ統合すると、外部API型・Program ID・スコア規則がCoreへ漏れる。残す。
-- Contextに別の永続DBを作るとtk/Registryが重複する。作らない。
-- Python製Research Orchestratorを削除しても現在の目的は満たせる。初期には作らない。
+## 15. 実装計画と受け入れ条件
 
-**entrypoint trace（設計上）**：
-- mlh run submit → CoreがRun登録 → JobBackend → ML Project → Artifact → Evaluator → Registry
-- mlh alphaevolve start → AE Adapter → 公式Controller ↔ AE managed service → 共通JobBackend/Evaluator → Registry → scores返却
-- Skillによる再開 → tk show ＋ mlh context → 研究の次の判断
-- Promotion → Accepted Run → integration branch → 新Candidate・再評価 → PR／merge
+最初から全機能を実装しない。以下の順序で、動作確認できた機能を増やす。
 
-未解消のReviseは実装・統合試験時に必ず検証する。
+### Phase 0：実行・評価の最小実装
 
-## 15. 仕事用アカウントへの引き継ぎ
+toy forecastingを使い、同じCandidateから異なるハイパーパラメータの2 Runを実行する。コード・設定・データ・評価Protocolを保存し、固定Evaluatorで比較できるところまで作る。
 
-この文書は**提案実装の仕様と判断理由をまとめたもの**。このdotfilesリポジトリにML Harnessの本体は実装しない。仕事用アカウントで独立した実装リポジトリを作り、この文書を仕様の出発点とする。
+この段階の完了条件は、同じ条件での再評価、評価条件の違いの検出、失敗したAttemptの記録が確認できること。
 
-最初のタスクは **Phase 0のtoy forecastingで、同じCandidateの2つのハイパーパラメータRunと固定Evaluatorを再現できること**。いきなり全ディレクトリや抽象クラスを作らず、実際の変更・失敗・importを調べてdesign-python-codeに沿って分割する。
+### Phase 1：研究ワークフローと本流への統合
 
-### 一次資料／参照
+ML Research Skill、tk連携、データアクセス設定、Approachとworktreeの分岐、Accept、Promote、研究レポートを実装する。
 
-- Google Cloud AlphaEvolve overview: https://docs.cloud.google.com/gemini/enterprise/docs/alphaevolve/developer-guide/overview
-- AlphaEvolve architecture: https://docs.cloud.google.com/gemini/enterprise/docs/alphaevolve/developer-guide/architecture-and-workflows
-- AlphaEvolve evaluator patterns: https://docs.cloud.google.com/gemini/enterprise/docs/alphaevolve/developer-guide/evaluator-patterns
-- Official AlphaEvolve client: https://github.com/Google-Cloud-AI/alphaevolve-on-googlecloud
-- Git worktree: https://git-scm.com/docs/git-worktree
-- Kaggle CSIRO agentic solution: https://github.com/Chihiro-n/csiro-biomass-agentic-solution
-- AIDE: https://github.com/wecoai/aideml
-- MLEvolve: https://github.com/InternScience/MLEvolve
-- tasukura/tk: https://github.com/mixidota2/tasukura
+同じApproach内の特徴量変更ではCandidateが増え、ハイパーパラメータ変更ではRunだけが増えることを確認する。複数Approachの研究を続けながら、一方の成果だけをmainへ統合する。
+
+### Phase 2：AlphaEvolveとの統合
+
+最小SeedとEvaluatorで、Program取得、Candidateとしての保存、Runの評価、scores/insights返却、選抜候補のGitへの取り込みを確認する。サービス利用権限がない環境ではMockの検証結果と実サービスの未検証状態を分ける。
+
+### Phase 3：リモート学習の実装
+
+用途に合うJob Backendを一つ追加する。リモートの投入・終了・回収、PC停止後の状態照合、重複起動の防止、Artifact欠落の扱いを確認する。
+
+### 15.1 横断的な完了条件
+
+完成したシステムは、次の状態を再現できなければならない。
+
+- 異なるアルゴリズムのApproachを並行して育てられる。
+- 一つのCandidateに複数のRunを登録し、ハイパーパラメータを完全に復元できる。
+- 同じ評価条件で得た数値だけを比較できる。
+- Verified Runを複数Acceptedにでき、Promote後のコードを再評価できる。
+- 一時的な実験ブランチを消しても、必要な結果と採用したコードを再現できる。
+- 失敗した実験や途中で方針を変更した理由が最終レポートに残る。
+- AlphaEvolveに接続しなくても、通常のCodexを使う研究機能が動作する。
+
+## 16. 未決事項と実装時の確認
+
+基本設計を作り直す必要はないが、次の仕様はまだ確定していない。
+
+| 未決事項 | 確認方法・決める時期 |
+| --- | --- |
+| Artifact Manifestの正式Schema | Phase 0で需要予測を使い、将来のランキング・最適化への拡張も確認 |
+| Evaluation Protocolの凍結と最終Holdoutの権限 | Phase 0〜1で認証・データ境界を実証 |
+| DatasetSnapshotの物理形式・保存期間 | データ規模とGCS費用に応じて選択 |
+| Job Backendの冪等性と状態復旧 | Phase 3の障害注入テストで決定 |
+| AlphaEvolveの現行SDK・契約・API | Phase 2で実サービスに接続して検証 |
+| CodexとClaude Codeの配布互換性 | プラグイン導入テストで確認 |
+| 多数のCandidate Bundleの削除規則 | 保存費用と採用履歴の保持条件から決定 |
+| Pythonの最終ディレクトリ分割 | 実装後に変更理由・依存関係を調査して確定 |
+
+現状は実装前の設計レビューであり、コードのimport関係、API互換性、実行コスト、実データの取扱いは未検証である。未検証を動作確認済みと記述しない。
+
+## 17. 仕事用の開発環境への引き継ぎ
+
+この設計書は、会話履歴を参照せずに実装を開始できることを目的としている。
+
+実装者は最初にPhase 0のtoy forecastingを作る。CandidateとRunの区別、Protocolでの採点、Artifact保存、失敗の記録を動作確認してから、Git分岐・Skill・AlphaEvolveを追加する。
+
+この文書が置かれているdotfilesリポジトリは設計書の保管先であり、ML Research Harnessの実装先ではない。実装コードは別リポジトリで管理する。Pythonコードの構成は [design-python-code](../../skills-local/.codex/skills/design-python-code/SKILL.md)、新しいSkillの検証は [create-validated-skill](../../skills-local/.codex/skills/create-validated-skill/SKILL.md) に従う。
+
+## 参考資料
+
+- Google Cloud： [AlphaEvolve概要](https://docs.cloud.google.com/gemini/enterprise/docs/alphaevolve/developer-guide/overview)、[使用方法](https://docs.cloud.google.com/gemini/enterprise/docs/alphaevolve/developer-guide/use-alphaevolve)
+- [Google Cloud公式AlphaEvolveクライアント](https://github.com/Google-Cloud-AI/alphaevolve-on-googlecloud)
+- [Git worktreeの公式ドキュメント](https://git-scm.com/docs/git-worktree)
+- [CSIRO Kaggleのエージェント活用事例](https://github.com/Chihiro-n/csiro-biomass-agentic-solution)
+- [AIDE](https://github.com/wecoai/aideml)、[MLEvolve](https://github.com/InternScience/MLEvolve)
+- [tk / tasukura](https://github.com/mixidota2/tasukura)
