@@ -1,5 +1,6 @@
 """Claude setup tests never install tools, authenticate, or use the real HOME."""
 
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -12,8 +13,9 @@ import yaml
 REPO = Path(__file__).resolve().parents[1]
 LOCAL = REPO / "skills-local/.codex/skills"
 NAMES = {
-    "create-validated-skill", "design-python-code", "eli5", "herdr",
-    "pi-extension-development", "sanitize-artifacts",
+    "consulting-slide", "create-validated-skill", "design-adk-ai-app", "design-python-code", "eli5",
+    "explain-before-shorten", "handoff", "hearing-workflow", "herdr", "iterative-improvement",
+    "pi-extension-development", "sanitize-artifacts", "technical-survey", "write-design-doc",
 }
 
 
@@ -67,6 +69,23 @@ class ClaudeInstallTests(unittest.TestCase):
         repeated = self.install()
         self.assertNotIn("backup  ", repeated)
         self.assertNotIn("link    ", repeated)
+
+    def test_links_global_agents_md_for_claude(self):
+        self.install()
+        target = self.home / ".claude/AGENTS.md"
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(os.readlink(target), str(REPO / "codex/.codex/AGENTS.md"))
+
+    def test_merges_managed_settings_and_keeps_local_ones(self):
+        settings = self.home / ".claude/settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"hooks": {"Stop": []}, "theme": "dark"}) + "\n")
+        self.install()
+        merged = json.loads(settings.read_text())
+        self.assertEqual((merged["hooks"], merged["theme"]), ({"Stop": []}, "dark"))
+        options = merged["pluginConfigs"]["cc-plugin-agents-md@builtin"]["options"]
+        self.assertEqual(options["instructionFiles"], "claude-md-and-agents-md")
+        self.assertIn("is up to date", self.install())
 
     def test_collision_is_backed_up_with_custom_contents(self):
         target = self.skills / "eli5"

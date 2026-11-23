@@ -1,8 +1,11 @@
 """Installer regressions. Every invocation uses an isolated temporary HOME."""
 
+import hashlib
+import json
 import os
 import re
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -77,6 +80,41 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(casks.count("stablyai/orca/orca"), 1)
         # The bare core cask is a different, disabled Plotly application.
         self.assertNotIn("orca", casks)
+
+    def test_pi_and_gcloud_are_in_brewfile(self):
+        brewfile = (REPO / "Brewfile").read_text()
+        formulas = re.findall(r'^\s*brew\s+["\']([^"\']+)["\']', brewfile, re.MULTILINE)
+        casks = re.findall(r'^\s*cask\s+["\']([^"\']+)["\']', brewfile, re.MULTILINE)
+        self.assertEqual(formulas.count("pi-coding-agent"), 1)
+        self.assertEqual(casks.count("gcloud-cli"), 1)
+
+    def test_merges_orca_settings_into_existing_profile_db(self):
+        db_path = self.home / "Library/Application Support/orca/profiles/local-default/profile-state.db"
+        db_path.parent.mkdir(parents=True)
+        initial = {"workspaceDir": "/local/only/path", "theme": "light", "voice": {"enabled": False}}
+        raw = json.dumps(initial)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "CREATE TABLE profile_state_documents "
+                "(domain TEXT PRIMARY KEY, payload TEXT, domain_version INT, revision INT, updated_at INT, content_hash TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO profile_state_documents VALUES ('settings', ?, 1, 5, 1000, ?)",
+                (raw, hashlib.sha256(raw.encode("utf-8")).hexdigest()),
+            )
+        self.install()
+        with sqlite3.connect(db_path) as conn:
+            payload, revision, content_hash = conn.execute(
+                "SELECT payload, revision, content_hash FROM profile_state_documents WHERE domain = 'settings'"
+            ).fetchone()
+        merged = json.loads(payload)
+        self.assertEqual(merged["workspaceDir"], "/local/only/path")
+        self.assertEqual(merged["theme"], "dark")
+        self.assertEqual(merged["terminalFontFamily"], "SF Mono")
+        self.assertEqual(merged["voice"]["sttModel"], "parakeet-tdt-ctc-0.6b-ja-int8")
+        self.assertEqual(revision, 6)
+        self.assertEqual(content_hash, hashlib.sha256(payload.encode("utf-8")).hexdigest())
+        self.assertIn("is up to date", self.install())
 
     def test_install_links_orca_and_preserves_other_orca_files(self):
         settings = self.target.parent / "settings.json"

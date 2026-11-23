@@ -1,0 +1,67 @@
+{
+  "$schema": "https://raw.githubusercontent.com/gotgenes/pi-packages/main/packages/pi-permission-system/schemas/permissions.schema.json",
+  "doublePressToConfirm": false,
+  "commandEffects": {
+    "git": {
+      "unlessOption": ["--output"],
+      "subcommands": {
+        "log": "read",
+        "show": "read",
+        "status": "read",
+        "diff": "read",
+        "branch": "read",
+        "rev-parse": "read",
+        "ls-files": "read"
+      }
+    }
+  },
+  "permission": {
+    "*": "allow",
+    "read": "allow",
+    "write": "allow",
+    "edit": "allow",
+    "grep": "allow",
+    "find": "allow",
+    "ls": "allow",
+    "mcp": {
+      "*": "allow"
+    },
+    "skill": {
+      "*": "allow"
+    },
+    "path": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.env.example": "allow",
+      "~/.ssh/*": "deny",
+      "~/.aws/*": "deny",
+      "~/.config/gcloud/*": "deny"
+    },
+    "path_write": {
+      "~/work/dotfiles/pi/.pi/agent/extensions/safety-guard.ts": "ask",
+      "~/work/dotfiles/pi/.pi/agent/extensions/pi-permission-system/config.json": "ask"
+    },
+    "external_directory_read": {
+      "*": "allow"
+    },
+    "external_directory_write": {
+      "*": "ask",
+      "/tmp/*": "allow",
+      "/private/tmp/*": "allow",
+      "/var/folders/*": "allow",
+      "/private/var/folders/*": "allow",
+      "~/work/dotfiles/*": "allow",
+      "~/orca/workspaces/*": "allow",
+      "~/work/worktrees/*": "allow",
+      "~/work/*-wt-*": "allow"
+    },
+    "bash": {
+      "*": "allow",
+      "rm -rf *": "ask",
+      "sudo *": "ask",
+      "git push *": "ask",
+      "git reset --hard*": "ask"
+    }
+  }
+}

@@ -19,11 +19,38 @@ The shell link installer is tested independently on Unix systems.
 
 Check `claude --version` and `claude doctor`, then start `claude` and sign in
 interactively yourself. No credentials, account settings, permissions, hooks,
-MCP servers, or global `CLAUDE.md` are installed by this repository.
+MCP servers, or global `CLAUDE.md` are installed by this repository; only the
+settings keys described below are merged.
+
+## Global instructions
+
+The installer links `~/.claude/AGENTS.md` to the same `codex/.codex/AGENTS.md`
+that Codex uses. Claude Code has no user-level `AGENTS.md` location; it reads
+[`AGENTS.md` and `.claude/AGENTS.md` in the working directory and the directories
+above it](https://code.claude.com/docs/en/memory#when-claude-code-reads-agents-md),
+so this file applies when you work under `$HOME`. It requires Claude Code
+v2.1.277 or later.
+
+By default Claude Code reads `AGENTS.md` only when there is no `CLAUDE.md`,
+`.claude/CLAUDE.md`, or `CLAUDE.local.md` in the working directory or above it.
+`claude/settings-additions.json` sets `"language": "日本語"` and sets
+[**Project instructions** to `claude-md-and-agents-md`](https://code.claude.com/docs/en/memory#choose-which-instruction-files-load)
+so Claude Code responds in Japanese by default and the global instructions also
+load in repositories that have a `CLAUDE.md`.
+
+## Settings
+
+`~/.claude/settings.json` is not linked: Claude Code and other apps (such as
+Orca's hooks) write their own settings there. The installer merges only the keys
+in `claude/settings-additions.json` into it with `claude/merge_settings.py`,
+keeping every other key, and rewrites the file only when a value changes. A file
+that is not a JSON object is left untouched with a warning. Merging needs
+`python3`; without it the installer prints the file to merge by hand. To manage
+another setting here, add its key to `claude/settings-additions.json`.
 
 ## Skills
 
-The six directories in `skills-local/.codex/skills` are the shared source of truth.
+The eight directories in `skills-local/.codex/skills` are the shared source of truth.
 The installer links each directory separately into `~/.claude/skills`, a
 [personal skill location supported by Claude Code](https://code.claude.com/docs/en/skills).
 Individual directory symlinks are supported. Unmarked local skill directories with a
@@ -55,7 +82,7 @@ Start a new Claude Code session and check `/skills`. Invoke `/tk`, `/eli5 topic`
 These are Claude Code slash commands; the `$skill-name` examples and statement
 that `/eli5` is not a command in the shared instructions describe Codex only.
 
-All six local skills have standard `name` and `description` frontmatter, but
+All eight local skills have standard `name` and `description` frontmatter, but
 being discoverable does not guarantee every workflow is agent-independent:
 
 - `create-validated-skill` shares its creation workflow and evaluation manifests

@@ -1,10 +1,23 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
-import { resolve, relative, isAbsolute } from "node:path";
+import { extname, isAbsolute, relative, resolve } from "node:path";
 
 const HOME = homedir();
+const CODE_EXTENSIONS = new Set([
+	".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".css", ".scss", ".sql", ".vue", ".svelte", ".rs", ".go",
+]);
 
-export default function safetyGuard(pi: ExtensionAPI) {
+export type LiveMainRepoDetector = (absPath: string, cwd: string) => { repoRoot: string; branch: string; ports: string[] } | undefined;
+
+export default function safetyGuard(pi: ExtensionAPI, customLiveDetector?: LiveMainRepoDetector) {
+	const detectLiveMain = customLiveDetector ?? defaultLiveMainRepoDetector;
+	const approvedLiveMainRepos = new Set<string>();
+
+	pi.on("session_start", async () => {
+		approvedLiveMainRepos.clear();
+	});
+
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName === "bash") {
 			const input = event.input as { command?: string };
@@ -29,10 +42,26 @@ export default function safetyGuard(pi: ExtensionAPI) {
 			if (hardBlock) return { block: true, reason: hardBlock };
 
 			const confirmReason = guardedPathReason(abs);
-			if (confirmReason) {
+			if (confirmReason && process.env.PI_UNATTENDED !== "1") {
 				if (!ctx.hasUI) return { block: true, reason: `${confirmReason} No UI available for confirmation.` };
 				const ok = await ctx.ui.confirm("Safety guard", `${confirmReason}\n\nAllow editing this path?\n\n${abs}`);
 				if (!ok) return { block: true, reason: `Blocked by safety guard: ${confirmReason}` };
+			}
+
+			const liveMain = detectLiveMain(abs, ctx.cwd);
+			if (liveMain && !approvedLiveMainRepos.has(liveMain.repoRoot) && process.env.ALLOW_MAIN_LIVE_EDIT !== "1") {
+				const msg = `ローカルサーバー (${liveMain.ports.join(", ")}) が稼働中の ${liveMain.branch} ブランチ（${liveMain.repoRoot}）でコードファイルを直接編集しようとしています。デモ環境を壊さないよう Orca worktree または作業ブランチでの作業を推奨します。`;
+				if (!ctx.hasUI) {
+					return {
+						block: true,
+						reason: `${msg} Create/use a git worktree first, or set ALLOW_MAIN_LIVE_EDIT=1 if editing main directly was explicitly requested.`,
+					};
+				}
+				const ok = await ctx.ui.confirm("Live server on main branch", `${msg}\n\nこのまま ${liveMain.branch} ブランチを直接編集しますか？\n\n${abs}`);
+				if (!ok) {
+					return { block: true, reason: `Blocked direct edit on live ${liveMain.branch} branch (${liveMain.repoRoot}). Switch to an Orca/git worktree.` };
+				}
+				approvedLiveMainRepos.add(liveMain.repoRoot);
 			}
 		}
 	});
@@ -50,17 +79,31 @@ function dangerousBashReason(command: string): string | undefined {
 	return patterns.find(([pattern]) => pattern.test(normalized))?.[1];
 }
 
+const SAFE_EPHEMERAL_RM_TARGET_RE =
+	/^(?:\/tmp\/|\/private\/tmp\/|\$TMPDIR\/|\$\{TMPDIR[^}]*\}\/|[^\s;|&]*(?:\/\.mlh\/worktrees\/|\/worktrees\/pi-worktree-|\/orca\/workspaces\/))\S+$/;
+
+function isSafeEphemeralRmCommand(normalized: string): boolean {
+	const rmMatches = [...normalized.matchAll(/\brm\s+(-[A-Za-z]+\s+)+([^\n;|&]+)/g)];
+	if (rmMatches.length === 0) return false;
+	for (const m of rmMatches) {
+		const targets = m[2].trim().split(/\s+/).map((t) => t.replace(/^["']|["']$/g, ""));
+		if (targets.length === 0) return false;
+		if (!targets.every((t) => SAFE_EPHEMERAL_RM_TARGET_RE.test(t) && !t.includes(".."))) {
+			return false;
+		}
+	}
+	return true;
+}
+
 function suspiciousBashReason(command: string): string | undefined {
 	const normalized = command.replace(/\s+/g, " ").trim();
-	const patterns: Array<[RegExp, string]> = [
-		[/\bsudo\b/i, "Command uses sudo."],
-		[/\bchown\s+-R\b/i, "Command recursively changes ownership."],
-		[/\bchmod\s+-R\b/i, "Command recursively changes permissions."],
-		[/\brm\s+-[^\n;|&]*r/i, "Command recursively deletes files."],
-		[/\b(npm|pnpm|yarn|bun)\s+(install|add)\b/i, "Command changes JavaScript dependencies."],
-		[/\b(pip|uv)\s+(install|add)\b/i, "Command changes Python dependencies."],
-	];
-	return patterns.find(([pattern]) => pattern.test(normalized))?.[1];
+	if (/\bsudo\b/i.test(normalized)) return "Command uses sudo.";
+	if (/\bchown\s+-R\b/i.test(normalized)) return "Command recursively changes ownership.";
+	if (/\bchmod\s+-R\b/i.test(normalized)) return "Command recursively changes permissions.";
+	if (/\brm\s+-[^\n;|&]*r/i.test(normalized) && !isSafeEphemeralRmCommand(normalized)) {
+		return "Command recursively deletes files.";
+	}
+	return undefined;
 }
 
 function sensitivePathReason(abs: string): string | undefined {
@@ -75,8 +118,6 @@ function sensitivePathReason(abs: string): string | undefined {
 }
 
 function guardedPathReason(abs: string): string | undefined {
-	if (isInside(abs, resolve(HOME, ".pi", "agent", "extensions"))) return "Editing global pi extensions.";
-	if (isInside(abs, resolve(HOME, ".pi", "agent", "settings.json"))) return "Editing global pi settings.";
 	if (abs.endsWith("package-lock.json") || abs.endsWith("pnpm-lock.yaml") || abs.endsWith("yarn.lock") || abs.endsWith("uv.lock")) return "Editing a lockfile.";
 }
 
@@ -89,3 +130,95 @@ function isInside(path: string, parent: string): boolean {
 	const rel = relative(parent, path);
 	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
+
+function isProtectedCodePath(abs: string): boolean {
+	const ext = extname(abs).toLowerCase();
+	if (!CODE_EXTENSIONS.has(ext)) return false;
+	const normalized = abs.replace(/\\/g, "/");
+	if (
+		normalized.includes("/dotfiles/") ||
+		normalized.includes("/memo/") ||
+		normalized.includes("/docs/") ||
+		normalized.includes("/.pi/") ||
+		normalized.includes("/.claude/") ||
+		normalized.startsWith("/tmp/") ||
+		normalized.startsWith("/private/tmp/")
+	) {
+		return false;
+	}
+	return true;
+}
+
+function defaultLiveMainRepoDetector(
+	absPath: string,
+	cwd: string,
+): { repoRoot: string; branch: string; ports: string[] } | undefined {
+	if (!isProtectedCodePath(absPath)) return undefined;
+	try {
+		const targetDir = resolve(absPath, "..");
+		const gitInfo = execFileSync(
+			"git",
+			["rev-parse", "--show-toplevel", "--abbrev-ref", "HEAD", "--git-dir", "--git-common-dir"],
+			{ cwd: targetDir, encoding: "utf8", timeout: 1200, stdio: ["ignore", "pipe", "ignore"] },
+		).trim().split(/\r?\n/);
+		if (gitInfo.length < 4) return undefined;
+		const [repoRoot, branch, gitDir, gitCommonDir] = gitInfo;
+		if (branch !== "main" && branch !== "master") return undefined;
+		// Linked git worktrees have gitDir !== gitCommonDir and are already isolated from main.
+		if (resolve(targetDir, gitDir) !== resolve(targetDir, gitCommonDir)) return undefined;
+
+		const lsofOut = execFileSync(
+			"lsof",
+			["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"],
+			{ cwd, encoding: "utf8", timeout: 1500, stdio: ["ignore", "pipe", "ignore"] },
+		);
+		const pidPorts = new Map<string, Set<string>>();
+		let curPid = "";
+		for (const line of lsofOut.split(/\r?\n/)) {
+			if (line.startsWith("p")) {
+				curPid = line.slice(1);
+			} else if (line.startsWith("n") && curPid) {
+				const portMatch = line.match(/:(\d+)$/);
+				const port = portMatch?.[1];
+				if (port && /^(?:3000|3001|5173|5174|8000|8001|8080)$/.test(port)) {
+					let portsForPid = pidPorts.get(curPid);
+					if (!portsForPid) {
+						portsForPid = new Set();
+						pidPorts.set(curPid, portsForPid);
+					}
+					portsForPid.add(`:${port}`);
+				}
+			}
+		}
+		if (pidPorts.size === 0) return undefined;
+
+		const cwdOut = execFileSync(
+			"lsof",
+			["-a", "-p", [...pidPorts.keys()].join(","), "-d", "cwd", "-Fn"],
+			{ cwd, encoding: "utf8", timeout: 1500, stdio: ["ignore", "pipe", "ignore"] },
+		);
+		const matchedPorts = new Set<string>();
+		curPid = "";
+		for (const line of cwdOut.split(/\r?\n/)) {
+			if (line.startsWith("p")) {
+				curPid = line.slice(1);
+			} else if (line.startsWith("n") && curPid) {
+				const procCwd = line.slice(1);
+				if (isInside(procCwd, repoRoot)) {
+					for (const port of pidPorts.get(curPid) ?? []) matchedPorts.add(port);
+				}
+			}
+		}
+		if (matchedPorts.size === 0) return undefined;
+		return { repoRoot, branch, ports: [...matchedPorts].sort((a, b) => a.localeCompare(b)) };
+	} catch {
+		return undefined;
+	}
+}
+
+export const __test = {
+	isProtectedCodePath,
+	defaultLiveMainRepoDetector,
+	suspiciousBashReason,
+	dangerousBashReason,
+};

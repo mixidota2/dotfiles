@@ -40,7 +40,7 @@ Restore the external [tk skill](https://github.com/mixidota2/tasukura-skills) fo
 
 Files in this repository are the source of truth. Paths such as `~/.config/wezterm/wezterm.lua` are symbolic links into this repository, so normal edits appear directly in `git diff`.
 
-Runtime state and credentials are intentionally excluded. In particular, Codex configuration and authentication, Pi authentication, Claude Code settings and authentication, sessions, histories, caches, SQLite databases, Herdr sessions, and `~/.local/share/tk/tasks.db` are not managed here.
+Runtime state and credentials are intentionally excluded. In particular, Codex configuration and authentication, Pi authentication, Claude Code settings (except the keys in `claude/settings-additions.json`, which the installer merges) and authentication, sessions, histories, caches, SQLite databases, Herdr sessions, and `~/.local/share/tk/tasks.db` are not managed here.
 
 The installer skips `.DS_Store`, `__pycache__` directories, and Python bytecode (`*.pyc` and `*.pyo`) generated inside the checkout. Other configuration files, including dotfiles and new files, remain installable.
 
@@ -58,10 +58,10 @@ This repository starts from a reviewed file snapshot with a fresh Git history. P
 - `cmux`: file-managed preferences only; sessions and window geometry remain local.
 - `wezterm`: terminal appearance and keybindings.
 - `herdr`: keybindings only; logs, sockets, and sessions remain local.
-- `orca`: `~/.orca/keybindings.json` only; other Orca settings, sessions, and credentials remain local. See [the macOS shortcut mapping](docs/orca-shortcuts.md).
-- `pi`: global instructions, preferences, and custom extensions.
+- `orca`: `~/.orca/keybindings.json` and portable preferences merged from `orca-settings/settings-additions.json` into `profile-state.db` when an Orca profile is present; workspaces, sessions, and credentials remain local. See [the macOS shortcut mapping](docs/orca-shortcuts.md).
+- `pi`: global instructions, preferences (`gemini-4-argon` on `google-vertex`, `codemode`, and configured npm packages), and custom extensions (`--tools` restores extension dependencies and reconciles configured Pi packages).
 - `codex`: global `AGENTS.md` instructions and reusable approval rules. `~/.codex/config.toml`, including project trust and generated settings, remains local to each computer.
-- Claude Code: individual links to the six local skill directories under `~/.claude/skills`; settings, authentication, account-synced skills, and other user skills remain local.
+- Claude Code: individual links to the seven local skill directories under `~/.claude/skills`, `~/.claude/AGENTS.md` linked to the shared global `AGENTS.md`, and the keys in `claude/settings-additions.json` merged into `~/.claude/settings.json`; other settings, authentication, account-synced skills, and other user skills remain local.
 - `tk`: configuration only. The CLI is installed as a uv tool and its task database remains local.
 - `skills-local`: locally maintained skills. The external tk skill is restored by `skills/install.sh`.
 

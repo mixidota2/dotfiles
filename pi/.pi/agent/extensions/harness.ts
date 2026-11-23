@@ -1,8 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
+const HOME = homedir();
 const MAX_RECENT_CHARS = 18_000;
 const MAX_RECENT_ENTRIES = 80;
+const MIN_CURRENT_SESSION_ENTRIES = 6;
 
 type HarnessCandidate = {
 	title: string;
@@ -23,7 +28,7 @@ export default function harnessExtension(pi: ExtensionAPI) {
 		description: "Interactively analyze the current/recent session and implement selected pi harness, skill, tool, prompt, or extension improvements. With args, use them as the improvement request.",
 		handler: async (args, ctx) => {
 			const request = args.trim();
-			const recent = buildRecentSessionExcerpt(getRecentEntries(ctx));
+			const recent = buildRecentContextExcerpt(ctx, request);
 
 			if (request) {
 				const prompt = buildDirectHarnessPrompt(request, recent);
@@ -206,7 +211,11 @@ function buildDirectHarnessPrompt(request: string, recent: string): string {
 User request:
 ${request}
 
-Use the recent/current session excerpt as context. First decide the right implementation unit: extension, tool, skill, prompt template, context file, package, or no change. Explain briefly, then implement the selected improvement if it is safe and concrete. If code/config changes are made, run a smoke test before claiming completion.
+Use the recent/current session excerpt as context.
+1. Before running any inspection or search tools, first output a brief 1-2 sentence response telling the user what you are about to check.
+2. Decide the right implementation unit: extension, tool, skill, prompt template, context file, package, or no change.
+3. If the user is asking for a proposal, opinion, or design discussion, or if there are multiple design options/trade-offs that need user agreement, explain the root cause and options first and confirm with \`ask_user_question\` before editing files. Otherwise, implement the selected improvement safely and concretely.
+4. If code/config changes are made, run a smoke test before claiming completion.
 
 Mandatory verification rule:
 - For Pi extension/tool changes, do not stop at import/load checks. Also run a behavior-level smoke test when feasible: register the extension with a fake ExtensionAPI, call the custom tool execute function, or invoke the event/command handler with a minimal mock context.
@@ -269,15 +278,316 @@ function stringField(value: unknown): string {
 	return typeof value === "string" ? value.trim() : "";
 }
 
-function parseJsonObject(text: string): unknown {
+function parseJsonObject(text: string): Record<string, unknown> {
 	const trimmed = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
 	try {
-		return JSON.parse(trimmed);
+		return JSON.parse(trimmed) as Record<string, unknown>;
 	} catch {
 		const start = trimmed.indexOf("{");
 		const end = trimmed.lastIndexOf("}");
-		if (start >= 0 && end > start) return JSON.parse(trimmed.slice(start, end + 1));
+		if (start >= 0 && end > start) return JSON.parse(trimmed.slice(start, end + 1)) as Record<string, unknown>;
 		throw new Error(`Model did not return JSON: ${trimmed.slice(0, 300)}`);
+	}
+}
+
+function clampSection(text: string, maxChars: number): string {
+	const trimmed = text.trim();
+	if (trimmed.length <= maxChars) return trimmed;
+	return `…(truncated)\n${trimmed.slice(trimmed.length - maxChars)}`;
+}
+
+const IGNORED_ENTRY_TYPES = new Set([
+	"session",
+	"model_change",
+	"thinking_level_change",
+	"attachment",
+	"api-request",
+	"api-request-blob",
+	"file-history-snapshot",
+	"last-prompt",
+	"mode",
+	"atis-latch",
+	"ai-title",
+	"system",
+	"queue-operation",
+]);
+
+const NOISE_TEXT_PREFIXES = [
+	"<local-command-caveat>",
+	"<command-name>",
+	"<command-message>",
+	"<local-command-stdout>",
+	"Base directory for this skill:",
+	"<task-notification>",
+	"Another Claude session sent a message:",
+	"<total_tokens>",
+];
+
+function isNoiseText(text: string): boolean {
+	const trimmed = text.trim();
+	if (!trimmed) return true;
+	return NOISE_TEXT_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
+}
+
+function buildRecentContextExcerpt(ctx: any, request = ""): string {
+	const currentEntries = getRecentEntries(ctx);
+	const currentExcerpt = buildRecentSessionExcerpt(currentEntries);
+	const sections: string[] = [];
+	if (currentExcerpt) {
+		sections.push(`## Current Session\n${clampSection(currentExcerpt, 8_000)}`);
+	}
+
+	const currentSessionFile = typeof ctx?.sessionManager?.getSessionFile === "function"
+		? ctx.sessionManager.getSessionFile()
+		: undefined;
+	const cwd = typeof ctx?.cwd === "string" && ctx.cwd ? ctx.cwd : process.cwd();
+	const preferClaude = /claude|cladue|クロード/i.test(request);
+
+	if (preferClaude || countMessageEntries(currentEntries) < MIN_CURRENT_SESSION_ENTRIES) {
+		const fallbackExcerpt = collectRecentWorkspaceSessionsExcerpt(cwd, currentSessionFile, HOME, { preferClaude });
+		if (fallbackExcerpt) {
+			sections.push(`## Recent Workspace Sessions\n${clampSection(fallbackExcerpt, preferClaude ? 12_000 : 6_000)}`);
+		}
+	}
+
+	const tkExcerpt = collectTkExcerpt(cwd);
+	if (tkExcerpt) {
+		sections.push(`## Recent Task Records (tk)\n${clampSection(tkExcerpt, 3_500)}`);
+	}
+
+	return sections.join("\n\n").trim();
+}
+
+function countMessageEntries(entries: unknown[]): number {
+	let count = 0;
+	for (const entry of entries) {
+		const e = entry as any;
+		const role = e?.message?.role ?? e?.role;
+		if (role === "user" || role === "assistant") count += 1;
+	}
+	return count;
+}
+
+function piSessionDirForCwd(cwd: string, homeDir = HOME): string {
+	const slug = `--${cwd.replace(/^\/+/, "").replace(/[\/\\:]+/g, "-")}--`;
+	return join(homeDir, ".pi", "agent", "sessions", slug);
+}
+
+function claudeProjectDirForCwd(cwd: string, homeDir = HOME): string {
+	const slug = `-${cwd.replace(/^\/+/, "").replace(/[\/\\:]+/g, "-")}`;
+	return join(homeDir, ".claude", "projects", slug);
+}
+
+function listRecentJsonlFiles(dir: string, excludeFile: string | undefined, limit: number): string[] {
+	if (!existsSync(dir)) return [];
+	try {
+		return readdirSync(dir)
+			.filter((name) => name.endsWith(".jsonl"))
+			.map((name) => {
+				const fullPath = join(dir, name);
+				try {
+					return { fullPath, mtimeMs: statSync(fullPath).mtimeMs };
+				} catch {
+					return null;
+				}
+			})
+			.filter((item): item is { fullPath: string; mtimeMs: number } => !!item && item.fullPath !== excludeFile)
+			.sort((a, b) => b.mtimeMs - a.mtimeMs)
+			.slice(0, limit)
+			.map((item) => item.fullPath);
+	} catch {
+		return [];
+	}
+}
+
+function listRecentPiFilesAcrossWorkspaces(
+	homeDir: string,
+	excludeFiles: Set<string>,
+	limit: number,
+	maxAgeMs = 14 * 24 * 60 * 60 * 1000,
+): string[] {
+	const sessionsRoot = join(homeDir, ".pi", "agent", "sessions");
+	if (!existsSync(sessionsRoot)) return [];
+	const cutoff = Date.now() - maxAgeMs;
+	const candidates: Array<{ fullPath: string; mtimeMs: number }> = [];
+	try {
+		for (const wsEntry of readdirSync(sessionsRoot)) {
+			if (!wsEntry.startsWith("--") || wsEntry.startsWith("--private-tmp-hakaru-")) continue;
+			const wsDir = join(sessionsRoot, wsEntry);
+			try {
+				if (!statSync(wsDir).isDirectory()) continue;
+				for (const name of readdirSync(wsDir)) {
+					if (!name.endsWith(".jsonl") || name === "session.jsonl") continue;
+					const fullPath = join(wsDir, name);
+					if (excludeFiles.has(fullPath)) continue;
+					try {
+						const mtimeMs = statSync(fullPath).mtimeMs;
+						if (mtimeMs >= cutoff) candidates.push({ fullPath, mtimeMs });
+					} catch {
+						// Ignore unreadable session files.
+					}
+				}
+			} catch {
+				// Ignore unreadable workspace dirs.
+			}
+		}
+	} catch {
+		return [];
+	}
+	return candidates
+		.sort((a, b) => b.mtimeMs - a.mtimeMs)
+		.slice(0, limit)
+		.map((item) => item.fullPath);
+}
+
+function listRecentClaudeFilesAcrossProjects(
+	homeDir: string,
+	excludeFiles: Set<string>,
+	limit: number,
+	maxAgeMs = 14 * 24 * 60 * 60 * 1000,
+): string[] {
+	const projectsRoot = join(homeDir, ".claude", "projects");
+	if (!existsSync(projectsRoot)) return [];
+	const cutoff = Date.now() - maxAgeMs;
+	const candidates: Array<{ fullPath: string; mtimeMs: number }> = [];
+	try {
+		for (const projectEntry of readdirSync(projectsRoot)) {
+			if (projectEntry.startsWith("-private-tmp-hakaru-") || projectEntry === "-private-tmp") continue;
+			const projectDir = join(projectsRoot, projectEntry);
+			try {
+				if (!statSync(projectDir).isDirectory()) continue;
+				for (const name of readdirSync(projectDir)) {
+					if (!name.endsWith(".jsonl")) continue;
+					const fullPath = join(projectDir, name);
+					if (excludeFiles.has(fullPath)) continue;
+					try {
+						const mtimeMs = statSync(fullPath).mtimeMs;
+						if (mtimeMs >= cutoff) candidates.push({ fullPath, mtimeMs });
+					} catch {
+						// Ignore unreadable session files.
+					}
+				}
+			} catch {
+				// Ignore unreadable project dirs.
+			}
+		}
+	} catch {
+		return [];
+	}
+	return candidates
+		.sort((a, b) => b.mtimeMs - a.mtimeMs)
+		.slice(0, limit)
+		.map((item) => item.fullPath);
+}
+
+function collectRecentToolFrictionSummary(files: string[]): string {
+	const counts = new Map<string, number>();
+	const bump = (label: string, n = 1) => counts.set(label, (counts.get(label) ?? 0) + n);
+
+	for (const file of files) {
+		try {
+			const raw = readFileSync(file, "utf8");
+			const webSearchHits = (raw.match(/allowedPartnerModelFeatures[^\n]*web_search/g) ?? []).length;
+			if (webSearchHits > 0) bump("Claude WebSearch 400 (Vertex org policy)", webSearchHits);
+			const sleepHits = (raw.match(/went to sleep mid-response/g) ?? []).length;
+			if (sleepHits > 0) bump("System sleep mid-response", sleepHits);
+			const dnsHits = (raw.match(/ENOTFOUND oauth2\.googleapis\.com/g) ?? []).length;
+			if (dnsHits > 0) bump("DNS ENOTFOUND oauth2.googleapis.com", dnsHits);
+			const tkHits = (raw.match(/Usage: tk\b/g) ?? []).length;
+			if (tkHits > 0) bump("tk CLI usage/syntax error", tkHits);
+			const partialEditHits = (raw.match(/PARTIAL APPLY|RETRYABLE — Edit/g) ?? []).length;
+			if (partialEditHits > 0) bump("Edit partial-apply / retryable mismatch", partialEditHits);
+			const modHits = (raw.match(/ModuleNotFoundError: No module named '[^']+'/g) ?? []).length;
+			if (modHits > 0) bump("Python ModuleNotFoundError", modHits);
+		} catch {
+			// Ignore unreadable files.
+		}
+	}
+
+	const entries = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+	if (entries.length === 0) return "";
+	return entries.map(([k, v]) => `- ${k}: ${v} occurrence(s)`).join("\n");
+}
+
+function collectRecentWorkspaceSessionsExcerpt(
+	cwd: string,
+	excludeSessionFile?: string,
+	homeDir = HOME,
+	options?: { preferClaude?: boolean },
+): string {
+	const preferClaude = Boolean(options?.preferClaude);
+	const localPiFiles = listRecentJsonlFiles(piSessionDirForCwd(cwd, homeDir), excludeSessionFile, preferClaude ? 2 : 3);
+	const seenPi = new Set<string>(excludeSessionFile ? [excludeSessionFile, ...localPiFiles] : localPiFiles);
+	const crossPiFiles = listRecentPiFilesAcrossWorkspaces(homeDir, seenPi, 3);
+	const piFiles = [...localPiFiles, ...crossPiFiles];
+
+	const localClaudeFiles = listRecentJsonlFiles(claudeProjectDirForCwd(cwd, homeDir), excludeSessionFile, preferClaude ? 3 : 2);
+	const seenClaude = new Set<string>(excludeSessionFile ? [excludeSessionFile, ...localClaudeFiles] : localClaudeFiles);
+	const crossProjectClaudeFiles = listRecentClaudeFilesAcrossProjects(homeDir, seenClaude, preferClaude ? 4 : 3);
+	const claudeFiles = [...localClaudeFiles, ...crossProjectClaudeFiles];
+
+	const files = preferClaude ? [...claudeFiles, ...piFiles] : [...piFiles, ...claudeFiles];
+	const blocks: string[] = [];
+	const perSessionChars = preferClaude ? 2_400 : 1_600;
+	const perSessionEntries = preferClaude ? 24 : 16;
+	const maxTotalChars = preferClaude ? 12_000 : 8_000;
+	let totalChars = 0;
+
+	const frictionSummary = collectRecentToolFrictionSummary(files);
+	if (frictionSummary) {
+		const summaryBlock = `#### Cross-Session Tool & API Friction\n${frictionSummary}`;
+		blocks.push(summaryBlock);
+		totalChars += summaryBlock.length + 2;
+	}
+
+	for (const file of files) {
+		const tail = readJsonlTail(file, 48);
+		const rawExcerpt = buildRecentSessionExcerpt(tail, perSessionEntries, {
+			user: 800,
+			assistant: 220,
+			collapseConsecutiveAssistant: true,
+		});
+		const excerpt = clampSection(rawExcerpt, perSessionChars);
+		if (excerpt) {
+			const name = file.split(/[\\/]/).pop() ?? file;
+			const block = `#### Session ${name}\n${excerpt}`;
+			if (blocks.length > 0 && totalChars + block.length + 2 > maxTotalChars) break;
+			blocks.push(block);
+			totalChars += block.length + 2;
+		}
+	}
+	return blocks.join("\n\n");
+}
+
+function collectTkExcerpt(cwd: string, runCommand?: (args: string[]) => string): string {
+	const execTk = runCommand ?? ((args: string[]) =>
+		execFileSync("tk", args, {
+			cwd,
+			encoding: "utf8",
+			timeout: 2500,
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim());
+
+	try {
+		const listOut = execTk(["list", "--all"]);
+		if (!listOut) return "";
+		const inProgressIds: string[] = [];
+		for (const line of listOut.split(/\r?\n/)) {
+			const match = line.match(/^(01[0-9A-HJKMNP-TV-Z]{10,24})\s+in_progress\b/);
+			if (match) inProgressIds.push(match[1]);
+		}
+		const details: string[] = [`### tk list --all\n${listOut}`];
+		for (const id of inProgressIds.slice(0, 2)) {
+			try {
+				const showOut = execTk(["show", id, "--logs", "5"]);
+				if (showOut) details.push(`### tk show ${id} --logs 5\n${showOut}`);
+			} catch {
+				// Ignore individual task fetch errors.
+			}
+		}
+		return details.join("\n\n");
+	} catch {
+		return "";
 	}
 }
 
@@ -305,46 +615,101 @@ function safeEntries(readEntries: () => unknown): unknown[] {
 	}
 }
 
+function isMeaningfulSessionEntry(entry: unknown): boolean {
+	if (!entry || typeof entry !== "object") return false;
+	const e = entry as any;
+	if (typeof e.type === "string" && IGNORED_ENTRY_TYPES.has(e.type)) return false;
+	const role = e.message?.role ?? e.role ?? e.type ?? e.customType ?? "entry";
+	if (IGNORED_ENTRY_TYPES.has(String(role))) return false;
+	const text = extractText(e.message?.content ?? e.content ?? e.text ?? e.summary ?? e);
+	return !isNoiseText(text);
+}
+
 function readJsonlTail(path: string, maxEntries: number): unknown[] {
 	const text = readFileSync(path, "utf8");
-	const lines = text.trim().split(/\r?\n/).filter(Boolean).slice(-maxEntries);
-	const entries: unknown[] = [];
-	for (const line of lines) {
+	const lines = text.trim().split(/\r?\n/).filter(Boolean);
+	const collected: unknown[] = [];
+	for (let i = lines.length - 1; i >= 0 && collected.length < maxEntries; i -= 1) {
 		try {
-			entries.push(JSON.parse(line));
+			const parsed = JSON.parse(lines[i]);
+			if (isMeaningfulSessionEntry(parsed)) {
+				collected.push(parsed);
+			}
 		} catch {
 			// Ignore partial/corrupt lines; session JSONL can be written concurrently.
 		}
 	}
-	return entries;
+	const reversed: unknown[] = [];
+	for (let i = collected.length - 1; i >= 0; i -= 1) {
+		reversed.push(collected[i]);
+	}
+	return reversed;
 }
 
-function buildRecentSessionExcerpt(entries: unknown[]): string {
-	const lines: string[] = [];
-	for (const entry of entries.slice(-40)) {
+function buildRecentSessionExcerpt(
+	entries: unknown[],
+	maxSlice = 40,
+	perMessageMaxChars?: { user: number; assistant: number; collapseConsecutiveAssistant?: boolean },
+): string {
+	const meaningful = entries.filter(isMeaningfulSessionEntry);
+	const normalized: Array<{ role: string; text: string }> = [];
+	for (const entry of meaningful) {
 		const e = entry as any;
-		const role = e.message?.role ?? e.role ?? e.type ?? e.customType ?? "entry";
+		const role = String(e.message?.role ?? e.role ?? e.type ?? e.customType ?? "entry");
 		const text = extractText(e.message?.content ?? e.content ?? e.text ?? e.summary ?? e);
-		if (!text) continue;
-		lines.push(`### ${role}\n${text}`);
+		if (isNoiseText(text)) continue;
+		if (
+			perMessageMaxChars?.collapseConsecutiveAssistant &&
+			role === "assistant" &&
+			normalized.at(-1)?.role === "assistant"
+		) {
+			normalized.pop();
+			normalized.push({ role, text });
+		} else {
+			normalized.push({ role, text });
+		}
+	}
+
+	const lines: string[] = [];
+	for (const item of normalized.slice(-maxSlice)) {
+		let { text } = item;
+		if (perMessageMaxChars) {
+			const limit = item.role === "user" ? perMessageMaxChars.user : perMessageMaxChars.assistant;
+			if (text.length > limit) {
+				text = `${text.slice(0, limit)}…`;
+			}
+		}
+		lines.push(`### ${item.role}\n${text}`);
 	}
 	const joined = lines.join("\n\n");
 	return joined.length > MAX_RECENT_CHARS ? joined.slice(joined.length - MAX_RECENT_CHARS) : joined;
 }
 
+function stripInjectedContracts(text: string): string {
+	return text
+		.split(/\n\[(?:TK HANDOFF CONTEXT|EVIDENCE CONTRACT|DESIGN PLAN MODE CONTRACT|PROPOSAL-ONLY BOUNDARY CONTRACT)\]/)[0]
+		?.trim() ?? text.trim();
+}
+
 function extractText(value: unknown): string {
-	if (typeof value === "string") return value.trim();
+	if (typeof value === "string") return stripInjectedContracts(value);
 	if (Array.isArray(value)) {
-		return value.map((item) => {
+		return stripInjectedContracts(value.map((item) => {
 			if (typeof item === "string") return item;
-			if (item && typeof item === "object" && "text" in item) return String((item as { text: unknown }).text ?? "");
+			if (item && typeof item === "object") {
+				const obj = item as Record<string, unknown>;
+				if ("text" in obj && typeof obj.text === "string") return obj.text;
+				if (obj.type === "toolCall" && obj.name === "ask_user_question") {
+					return `[toolCall: ask_user_question] ${JSON.stringify(obj.arguments ?? {}).slice(0, 300)}`;
+				}
+			}
 			return "";
-		}).join("\n").trim();
+		}).filter(Boolean).join("\n"));
 	}
 	if (value && typeof value === "object") {
 		const obj = value as Record<string, unknown>;
-		if (typeof obj.text === "string") return obj.text.trim();
-		if (typeof obj.content === "string") return obj.content.trim();
+		if (typeof obj.text === "string") return stripInjectedContracts(obj.text);
+		if (typeof obj.content === "string") return stripInjectedContracts(obj.content);
 	}
 	return "";
 }
@@ -352,3 +717,16 @@ function extractText(value: unknown): string {
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
+
+export const __test = {
+	buildRecentContextExcerpt,
+	buildRecentSessionExcerpt,
+	collectRecentWorkspaceSessionsExcerpt,
+	collectRecentToolFrictionSummary,
+	listRecentPiFilesAcrossWorkspaces,
+	listRecentClaudeFilesAcrossProjects,
+	collectTkExcerpt,
+	getRecentEntries,
+	piSessionDirForCwd,
+	claudeProjectDirForCwd,
+};

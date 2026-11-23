@@ -10,7 +10,7 @@ usage() {
 Usage: ./install.sh [--dry-run] [--tools]
 
   --dry-run  Print filesystem changes and tool commands without applying them.
-  --tools    Install Homebrew dependencies (including Claude Code) and tk.
+  --tools    Install Homebrew dependencies (including Claude Code, Pi, Orca, and gcloud), tk, and Pi packages.
 EOF
 }
 
@@ -108,7 +108,7 @@ link_package() {
   package=$1
   # Tests and local applications can create these files inside the checkout.
   # Keep real configuration files, including dotfiles and newly added files.
-  find "$repo_dir/$package" -type d -name __pycache__ -prune -o \
+  find "$repo_dir/$package" \( -type d -name __pycache__ -o -type d -name node_modules \) -prune -o \
     -type f ! -name .DS_Store ! -name '*.pyc' ! -name '*.pyo' -print |
     while IFS= read -r source; do
       link_file "$source"
@@ -133,6 +133,23 @@ install_user_tools() {
   else
     run uv tool install git+https://github.com/mixidota2/tasukura.git
   fi
+
+  if [ -f "$repo_dir/pi/.pi/agent/extensions/web-tools/package-lock.json" ]; then
+    if [ "$dry_run" = false ] && ! command -v npm >/dev/null 2>&1; then
+      printf 'npm was not found after brew bundle.\n' >&2
+      exit 1
+    fi
+    # index.ts is symlinked into $HOME; pi resolves imports from its real path here.
+    run npm --prefix "$repo_dir/pi/.pi/agent/extensions/web-tools" ci --omit=dev --ignore-scripts --no-audit --no-fund
+  fi
+
+  if [ -f "$repo_dir/pi/.pi/agent/settings.json" ]; then
+    if [ "$dry_run" = false ] && ! command -v pi >/dev/null 2>&1; then
+      printf 'pi was not found after brew bundle.\n' >&2
+      exit 1
+    fi
+    run pi update --extensions
+  fi
 }
 
 for package in shell cmux wezterm yazi nvim herdr orca pi codex tk skills-local; do
@@ -150,6 +167,56 @@ for skill_dir in "$repo_dir"/skills-local/.codex/skills/*; do
   skill_name=${skill_dir##*/}
   link_path "$skill_dir" ".claude/skills/$skill_name"
 done
+
+# Claude Code reads .claude/AGENTS.md in the working directory and its parents
+# when no CLAUDE.md is there, so this applies the global instructions to work
+# under HOME. Claude Code has no user-level AGENTS.md location of its own.
+link_path "$repo_dir/codex/.codex/AGENTS.md" ".claude/AGENTS.md"
+if [ ! -e "$repo_dir/pi/.pi/agent/AGENTS.md" ]; then
+  link_path "$repo_dir/codex/.codex/AGENTS.md" ".pi/agent/AGENTS.md"
+fi
+
+# ~/.claude/settings.json also holds settings written by Claude Code and other
+# apps (such as Orca's hooks), so only the keys this repository manages are
+# merged into it instead of linking the file.
+merge_claude_settings() {
+  additions=$repo_dir/claude/settings-additions.json
+  target=$HOME/.claude/settings.json
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'skip    %s (python3 not found; add the keys in %s yourself)\n' "$target" "$additions" >&2
+    return
+  fi
+  # -B: macOS's python3 otherwise writes bytecode caches under ~/Library.
+  if [ "$dry_run" = true ]; then
+    python3 -B "$repo_dir/claude/merge_settings.py" "$additions" "$target" --check || :
+    return
+  fi
+  mkdir -p "$(dirname "$target")"
+  # A settings file that cannot be read is left as it is; linking still completes.
+  python3 -B "$repo_dir/claude/merge_settings.py" "$additions" "$target" || :
+}
+merge_claude_settings
+
+# Merge portable Orca preferences into local-default profile-state.db when an
+# Orca profile already exists on this machine.
+merge_orca_settings() {
+  additions=$repo_dir/orca-settings/settings-additions.json
+  script=$repo_dir/orca-settings/merge_settings.py
+  target="$HOME/Library/Application Support/orca/profiles/local-default/profile-state.db"
+  if [ ! -f "$script" ] || [ ! -f "$target" ]; then
+    return
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf 'skip    %s (python3 not found; add the keys in %s yourself)\n' "$target" "$additions" >&2
+    return
+  fi
+  if [ "$dry_run" = true ]; then
+    python3 -B "$script" "$additions" "$target" --check || :
+    return
+  fi
+  python3 -B "$script" "$additions" "$target" || :
+}
+merge_orca_settings
 
 # Pi and Codex share one skill installation.
 pi_skills=$HOME/.pi/agent/skills

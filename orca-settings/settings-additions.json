@@ -1,0 +1,34 @@
+{
+  "worktreeVisibilityDefaults": {
+    "external": "hide"
+  },
+  "nestWorkspaces": true,
+  "refreshLocalBaseRefOnWorktreeCreate": true,
+  "autoRenameBranchFromWork": true,
+  "branchPrefix": "git-username",
+  "theme": "dark",
+  "appFontFamily": "Geist",
+  "editorWordWrap": true,
+  "terminalFontSize": 18,
+  "terminalFontFamily": "SF Mono",
+  "terminalFontWeight": 500,
+  "terminalFontWeightBold": 700,
+  "terminalLineHeight": 1,
+  "terminalCursorStyle": "block",
+  "terminalCursorBlink": true,
+  "terminalThemeDark": "Ghostty Default Style Dark",
+  "terminalUseSeparateLightTheme": true,
+  "terminalThemeLight": "Builtin Tango Light",
+  "terminalAllowOsc52Clipboard": true,
+  "ctrlTabOrderMode": "mru",
+  "terminalShortcutPolicy": "orca-first",
+  "agentStatusHooksEnabled": true,
+  "agentWorkspaceTrustEnabled": true,
+  "voice": {
+    "enabled": true,
+    "sttModel": "parakeet-tdt-ctc-0.6b-ja-int8",
+    "language": "en",
+    "dictationMode": "toggle",
+    "terminalConfirmBeforeInsert": false
+  }
+}

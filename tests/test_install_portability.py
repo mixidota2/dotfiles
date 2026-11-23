@@ -102,6 +102,8 @@ class InstallerPortabilityTests(unittest.TestCase):
         }
         expected[str(self.home / ".pi/agent/skills")] = str(self.home / ".codex/skills")
         expected[str(self.home / ".claude/skills/new-skill")] = str(self.repo / "skills-local/.codex/skills/new-skill")
+        expected[str(self.home / ".claude/AGENTS.md")] = str(self.repo / "codex/.codex/AGENTS.md")
+        expected[str(self.home / ".claude/AGENTS.md")] = str(self.repo / "codex/.codex/AGENTS.md")
         preview = self.install("--dry-run")
         self.assertEqual(preview.returncode, 0, preview.stderr)
         planned = [line for line in preview.stdout.splitlines() if line.startswith("link    ")]
@@ -217,6 +219,20 @@ class InstallerPortabilityTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("tk is already installed", result.stdout)
         self.assertEqual(self.log.read_text().splitlines(), ["brew", "bundle", "--file", str(self.repo / "Brewfile")])
+
+    def test_real_tools_reconcile_pi_packages_and_web_tools_deps(self):
+        self.write_source("pi/.pi/agent/settings.json")
+        self.write_source("pi/.pi/agent/extensions/web-tools/package-lock.json")
+        for tool in ("brew", "uv", "tk", "npm", "pi"):
+            self.write_tool(tool)
+        result = self.install("--tools")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.log.read_text().splitlines(), [
+            "brew", "bundle", "--file", str(self.repo / "Brewfile"),
+            "npm", "--prefix", str(self.repo / "pi/.pi/agent/extensions/web-tools"),
+            "ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund",
+            "pi", "update", "--extensions",
+        ])
 
 
 if __name__ == "__main__":

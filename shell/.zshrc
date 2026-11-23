@@ -7,10 +7,17 @@ if command -v mise >/dev/null 2>&1; then
   eval "$(mise activate zsh)"
 fi
 
-# Google Cloud SDK installed outside Homebrew.
-gcloud_dir="$HOME/google-cloud-sdk"
-[[ -f "$gcloud_dir/path.zsh.inc" ]] && source "$gcloud_dir/path.zsh.inc"
-[[ -f "$gcloud_dir/completion.zsh.inc" ]] && source "$gcloud_dir/completion.zsh.inc"
+# Initialize the completion system before any script calls compdef.
+autoload -Uz compinit && compinit
+
+# Google Cloud SDK (Homebrew gcloud-cli or standalone ~/google-cloud-sdk).
+for gcloud_dir in "$HOME/google-cloud-sdk" /opt/homebrew/share/google-cloud-sdk /usr/local/share/google-cloud-sdk; do
+  if [[ -f "$gcloud_dir/path.zsh.inc" ]]; then
+    source "$gcloud_dir/path.zsh.inc"
+    [[ -f "$gcloud_dir/completion.zsh.inc" ]] && source "$gcloud_dir/completion.zsh.inc"
+    break
+  fi
+done
 unset gcloud_dir
 
 # uv completion.
@@ -47,4 +54,25 @@ function mdview() {
   command nvim -n \
     -c 'lua require("md-render").preview.show_pager({ max_width = vim.o.columns })' \
     -- "$1"
+}
+
+# Load machine-local overrides (e.g. ANTHROPIC_VERTEX_PROJECT_ID) if present.
+[[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"
+
+# Claude Code: 対話では Vertex AI を使い、claude -p（--print）のときだけサブスクリプションを使う
+function claude() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -p|--print) command claude "$@"; return ;;
+    esac
+  done
+  local vertex_project="${ANTHROPIC_VERTEX_PROJECT_ID:-${GOOGLE_CLOUD_PROJECT:-}}"
+  if [[ -z "$vertex_project" ]] && command -v gcloud >/dev/null 2>&1; then
+    vertex_project="$(gcloud config get-value project 2>/dev/null)"
+  fi
+  CLAUDE_CODE_USE_VERTEX=1 \
+    ANTHROPIC_VERTEX_PROJECT_ID="$vertex_project" \
+    CLOUD_ML_REGION="${CLOUD_ML_REGION:-global}" \
+    command claude "$@"
 }
