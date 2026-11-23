@@ -18,6 +18,7 @@ REPO = Path(__file__).resolve().parents[1]
 SKILLS = REPO / "skills-local/.codex/skills"
 SCRIPTS = SKILLS / "create-validated-skill/scripts"
 SPEC = importlib.util.spec_from_file_location("skill_validator", SCRIPTS / "validate_skill.py")
+assert SPEC is not None and SPEC.loader is not None
 validator = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(validator)
 
@@ -29,7 +30,7 @@ class SkillValidationTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.skill = self.root / "example-skill"
         self.skill.mkdir()
-        self.frontmatter = {"name": "example-skill", "description": "Validate observable package behavior."}
+        self.frontmatter: dict[str, object] = {"name": "example-skill", "description": "Validate observable package behavior."}
         self.write_skill()
         self.task = {
             "id": "custom scenario 日本語", "kind": "typical", "scenario": "Produce a usable result.",
@@ -79,7 +80,7 @@ class SkillValidationTests(unittest.TestCase):
 
     def test_all_six_installed_skills_pass_without_mutating_historical_files(self):
         installed = sorted(path for path in SKILLS.iterdir() if (path / "SKILL.md").is_file())
-        self.assertEqual(len(installed), 10)
+        self.assertEqual(len(installed), 14)
         before = {path: path.read_bytes() for skill in installed for path in (skill / "evals").rglob("*.yaml")}
         for skill in installed:
             with self.subTest(skill=skill.name):

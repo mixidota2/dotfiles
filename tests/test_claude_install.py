@@ -14,7 +14,8 @@ REPO = Path(__file__).resolve().parents[1]
 LOCAL = REPO / "skills-local/.codex/skills"
 NAMES = {
     "consulting-slide", "create-validated-skill", "design-adk-ai-app", "design-python-code", "eli5",
-    "explain-before-shorten", "herdr", "pi-extension-development", "sanitize-artifacts", "write-design-doc",
+    "explain-before-shorten", "handoff", "hearing-workflow", "herdr", "iterative-improvement",
+    "pi-extension-development", "sanitize-artifacts", "technical-survey", "write-design-doc",
 }
 
 

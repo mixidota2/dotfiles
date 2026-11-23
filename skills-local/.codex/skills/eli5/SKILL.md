@@ -24,7 +24,8 @@ Write `$eli5 <topic>` in Codex. `/skills` opens the skill picker; `/eli5` is not
 1. Identify the single beginner question behind the topic. If the topic is ambiguous enough to change the explanation, ask one concise question; otherwise make the smallest reasonable assumption and name it.
 2. Build the explanation as a standalone `.html` file with responsive layout, readable large type, high contrast, and descriptive text alternatives for visuals.
 3. Check that a reader can understand the sequence without prior knowledge, and remove jargon, dense paragraphs, and unnecessary detail.
-4. Return the artifact path and a one-line summary. Do not paste the full HTML into chat unless the user asks.
+4. Visually verify the rendered HTML in a headless browser (`--headless --screenshot` or Playwright) **after the very last edit** to confirm there are no overlapping labels, clipped math/brackets, or broken panels. If you fix any visual issue, re-render and inspect again before finishing.
+5. Return the artifact path and a one-line summary. Do not paste the full HTML into chat unless the user asks.
 
 ## Boundaries
 

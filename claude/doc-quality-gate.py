@@ -36,6 +36,30 @@ PROHIBITED_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         "「解決の道筋」という回りくどい表現は「解決策」に直してください。",
     ),
     (
+        re.compile(r"後段"),
+        "「後段」という曖昧な表現は使わず、「次の段階」「後半の処理」など具体的な処理名に直してください。",
+    ),
+    (
+        re.compile(r"(?:(?<![上中下前後])段\s*[0-9０-９]+|第\s*[0-9０-９一二三四五六七八九十]+\s*段(?!(?:目|階|落)))"),
+        "工程や手順を「段1」「第1段」のように「段」で呼ばず、「ステップ1」「段階1」または具体的な処理名に直してください。",
+    ),
+    (
+        re.compile(r"物差し"),
+        "「物差し」という比喩表現は使わず、「評価基準」「比較軸」「指標」など対象領域の具体的な用語に直してください。",
+    ),
+    (
+        re.compile(r"(?:ひと塊|一塊|塊として|の塊)"),
+        "「塊」という曖昧な言い換えは使わず、「グループ」「まとまり」「区画」「モジュール」など具体的な名称に直してください。",
+    ),
+    (
+        re.compile(r"に資する"),
+        "「〜に資する」という硬い表現は避け、「〜に役立つ」「〜につながる」など素の動詞に直してください。",
+    ),
+    (
+        re.compile(r"(?:まず結論から申し上げますと|いかがでしたでしょうか|と言っても過言ではない)"),
+        "AI特有の定型枕・定型締めは削り、結論の文から直接書き始めてください。",
+    ),
+    (
         re.compile(r"^#{1,4}\s*(?:作るもの|設計の[0-9０-９一二三四五六七八九十]*つの柱|設計の柱)\s*$"),
         "「作るもの」「設計の柱」のような曖昧な見出しは避け、具体的な設計対象または標準見出しにしてください。",
     ),
@@ -65,6 +89,87 @@ def is_target_markdown(file_path: str) -> bool:
     if "skills" in parts or " skills-local" in file_path:
         return False
     return True
+
+
+def is_target_html(file_path: str) -> bool:
+    if not file_path:
+        return False
+    p = Path(file_path)
+    if p.suffix.lower() != ".html":
+        return False
+    if p.name.lower() in {"template.html", "index.html"}:
+        return False
+    parts = set(p.parts)
+    if "node_modules" in parts or "skills" in parts or "skills-local" in parts:
+        return False
+    return "memo" in parts or "docs" in parts
+
+
+def is_target_ui_code(file_path: str) -> bool:
+    if not file_path:
+        return False
+    p = Path(file_path)
+    if p.suffix.lower() not in {".tsx", ".jsx"}:
+        return False
+    norm = file_path.replace("\\", "/")
+    if any(seg in norm for seg in ("/node_modules/", "/tests/", "/__tests__/")):
+        return False
+    return not bool(re.search(r"\.(?:test|spec)\.[jt]sx$", p.name, re.IGNORECASE))
+
+
+def is_target_document(file_path: str) -> bool:
+    return is_target_markdown(file_path) or is_target_html(file_path) or is_target_ui_code(file_path)
+
+
+def inspect_ui_code(file_path: str, source: str) -> tuple[list[str], list[str]]:
+    cleaned = re.sub(r"/\*[\s\S]*?\*/", lambda m: re.sub(r"[^\n]", " ", m.group(0)), source)
+    cleaned = re.sub(r"(^|[^:])//[^\n]*", r"\1 ", cleaned, flags=re.MULTILINE)
+    jp_lines = [
+        (idx, line)
+        for idx, line in enumerate(cleaned.splitlines(), 1)
+        if re.search(r"[\u3040-\u30ff\u4e00-\u9faf]", line)
+    ]
+    ui_patterns = [
+        *[(p, msg) for p, msg in PROHIBITED_PATTERNS if not p.pattern.startswith("^#")],
+        (
+            re.compile(r"決めること\s*[:：]"),
+            "画面ラベルに「決めること：」のようなメタ見出しを置かず、意思決定の目的の文だけを直接表示してください。",
+        ),
+    ]
+    hard: list[str] = []
+    for pattern, message in ui_patterns:
+        matched_lines = [idx for idx, line in jp_lines if pattern.search(line)]
+        if matched_lines:
+            line_refs = ", ".join(f"L{n}" for n in matched_lines[:5])
+            hard.append(f"- {file_path} ({line_refs}): {message}")
+    return hard, []
+
+
+def inspect_html(file_path: str, html_text: str) -> tuple[list[str], list[str]]:
+    cleaned = re.sub(r"<!--[\s\S]*?-->", lambda m: re.sub(r"[^\n]", " ", m.group(0)), html_text)
+    cleaned = re.sub(
+        r"<script\b[^>]*>[\s\S]*?</script>",
+        lambda m: re.sub(r"[^\n]", " ", m.group(0)),
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"<style\b[^>]*>[\s\S]*?</style>",
+        lambda m: re.sub(r"[^\n]", " ", m.group(0)),
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    lines = list(enumerate(cleaned.splitlines(), 1))
+    hard: list[str] = []
+    for pattern, message in PROHIBITED_PATTERNS:
+        if pattern.pattern.startswith("^#"):
+            continue
+        matched_lines = [idx for idx, line in lines if pattern.search(line)]
+        if matched_lines:
+            line_refs = ", ".join(f"L{n}" for n in matched_lines[:5])
+            hard.append(f"- {file_path} ({line_refs}): {message}")
+    return hard, []
 
 
 def is_design_doc(file_path: str, text: str) -> bool:
@@ -188,7 +293,7 @@ def handle_post_tool_use(payload: dict) -> dict:
         return {}
     cwd = str(payload.get("cwd") or os.getcwd())
     abs_path = str(Path(raw_path) if Path(raw_path).is_absolute() else (Path(cwd) / raw_path).resolve())
-    if not is_target_markdown(abs_path) or not Path(abs_path).is_file():
+    if not is_target_document(abs_path) or not Path(abs_path).is_file():
         return {}
 
     session_id = str(payload.get("session_id") or "")
@@ -205,10 +310,17 @@ def handle_post_tool_use(payload: dict) -> dict:
     except Exception:
         return {}
 
-    hard, advisory = inspect_markdown(abs_path, text)
+    if is_target_html(abs_path):
+        hard, advisory = inspect_html(abs_path, text)
+    elif is_target_ui_code(abs_path):
+        hard, advisory = inspect_ui_code(abs_path, text)
+    else:
+        hard, advisory = inspect_markdown(abs_path, text)
+    if is_target_ui_code(abs_path) and not hard and not advisory:
+        return {}
     checklist = [
         "[DOCUMENT SELF-REVIEW GATE]",
-        f"Markdown 文書 ({Path(abs_path).name}) を更新しました。ユーザーへ完了報告する前に必ず以下を実施してください：",
+        f"文書・画面文言 ({Path(abs_path).name}) を更新しました。ユーザーへ完了報告する前に必ず以下を実施してください：",
         "1. 書き出したファイル全文を頭から読み直し、すべての文（特に Goals や箇条書き）に「誰が・何に対して・何をする（どうなる）か」の主語と述語があるか確かめる。",
         "2. 元の分析の指標（売上・粗利・客数の区別）や用語（DPT と部門、最適化と計算など）に揺れや節間の前後矛盾がないか確かめる。",
         "3. 頼まれていない将来の拡張案（エンハンス）や根拠のない社内手続き確認が紛れ込んでいないか確かめる。",
@@ -239,13 +351,18 @@ def handle_stop(payload: dict) -> dict:
 
     all_hard: list[str] = []
     for file_path in touched:
-        if not is_target_markdown(file_path) or not Path(file_path).is_file():
+        if not is_target_document(file_path) or not Path(file_path).is_file():
             continue
         try:
             text = Path(file_path).read_text(encoding="utf-8")
         except Exception:
             continue
-        hard, _ = inspect_markdown(file_path, text)
+        if is_target_html(file_path):
+            hard, _ = inspect_html(file_path, text)
+        elif is_target_ui_code(file_path):
+            hard, _ = inspect_ui_code(file_path, text)
+        else:
+            hard, _ = inspect_markdown(file_path, text)
         all_hard.extend(hard)
 
     if not all_hard:
@@ -253,7 +370,7 @@ def handle_stop(payload: dict) -> dict:
 
     reason = (
         "[DOCUMENT QUALITY GATE]\n"
-        "作成・編集した Markdown 文書に、手戻りの原因になる禁止表現または主語欠落が残っています。ユーザーに完了報告する前に修正してください：\n"
+        "作成・編集した文書または画面文言（Markdown / HTML / TSX）に、手戻りの原因になる禁止表現または主語欠落が残っています。ユーザーに完了報告する前に修正してください：\n"
         + "\n".join(all_hard)
     )
     return {
