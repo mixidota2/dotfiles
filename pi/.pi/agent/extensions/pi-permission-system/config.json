@@ -51,7 +51,10 @@
       "/private/tmp/*": "allow",
       "/var/folders/*": "allow",
       "/private/var/folders/*": "allow",
-      "~/work/dotfiles/*": "allow"
+      "~/work/dotfiles/*": "allow",
+      "~/orca/workspaces/*": "allow",
+      "~/work/worktrees/*": "allow",
+      "~/work/*-wt-*": "allow"
     },
     "bash": {
       "*": "allow",

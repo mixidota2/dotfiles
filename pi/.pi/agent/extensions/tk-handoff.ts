@@ -3,7 +3,9 @@ import { execFileSync } from "node:child_process";
 
 const TASK_ID_RE = /\b(01[0-9A-HJKMNP-TV-Z]{10,24})\b/;
 const CONTINUE_OR_TODO_RE =
-	/(?:続けて|つづけて|続き|再開|今日やること|やることなんだっけ|何やれば|タスク.*(?:確認|一覧|教えて|続けて))/i;
+	/(?:続けて|つづけて|続き|再開|今日(?:何|なに)?やる|やること(?:整理|確認|なんだっけ)|何やれば|これ進めて|進めておいて|タスク.*(?:確認|一覧|教えて|続けて|整理))/i;
+const WRAP_UP_RE =
+	/(?:今日は(?:もう|一旦|ここまでで|この辺で)?(?:終わり|終了|おわり)|終了しよう|終わりにしよう|続きは(?:明日|来週|次回)|一旦.*tkに記録|セッション.*リセット.*tkに記録|(?:寝る|帰る)から.*記録)/i;
 
 type ExecRunner = (cmd: string, args: string[], cwd: string) => string;
 
@@ -24,6 +26,18 @@ export default function tkHandoffExtension(pi: ExtensionAPI, customRunner?: Exec
 		injectedKeys.clear();
 	});
 
+	pi.on("tool_call", async (event) => {
+		if (event.toolName !== "bash") return;
+		const command = String((event.input as { command?: unknown })?.command ?? "");
+		const tkErr = findTkCommandError(command);
+		if (tkErr) {
+			return {
+				block: true,
+				reason: tkErr,
+			};
+		}
+	});
+
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (event.messageType !== "user") return;
 		const prompt = String(event.prompt ?? "").trim();
@@ -31,12 +45,14 @@ export default function tkHandoffExtension(pi: ExtensionAPI, customRunner?: Exec
 
 		const intent = detectTkIntent(prompt);
 		if (!intent) return;
-		if (injectedKeys.has(intent.dedupeKey)) return;
+		if (intent.kind !== "wrap_up" && injectedKeys.has(intent.dedupeKey)) return;
 
 		const snapshot = buildTkContextSnapshot(intent, ctx?.cwd ?? process.cwd(), run);
 		if (!snapshot) return;
 
-		injectedKeys.add(intent.dedupeKey);
+		if (intent.kind !== "wrap_up") {
+			injectedKeys.add(intent.dedupeKey);
+		}
 		return {
 			message: {
 				customType: "tk-handoff-context",
@@ -103,7 +119,7 @@ export default function tkHandoffExtension(pi: ExtensionAPI, customRunner?: Exec
 }
 
 type TkIntent = {
-	kind: "task_id" | "general";
+	kind: "task_id" | "general" | "wrap_up";
 	taskId?: string;
 	keyword?: string;
 	dedupeKey: string;
@@ -114,7 +130,15 @@ function extractTaskId(text: string): string | undefined {
 }
 
 function detectTkIntent(prompt: string): TkIntent | null {
-	const taskId = extractTaskId(prompt);
+	const core = prompt.split(/\n\[(?:TK HANDOFF|TK WRAP-UP|EVIDENCE|DESIGN PLAN|PROPOSAL-ONLY)/)[0]?.trim() ?? prompt;
+	const taskId = extractTaskId(core);
+	if (WRAP_UP_RE.test(core)) {
+		return {
+			kind: "wrap_up",
+			taskId,
+			dedupeKey: `wrap_up:${taskId ?? "active"}`,
+		};
+	}
 	if (taskId) {
 		return {
 			kind: "task_id",
@@ -122,10 +146,10 @@ function detectTkIntent(prompt: string): TkIntent | null {
 			dedupeKey: `id:${taskId}`,
 		};
 	}
-	if (!CONTINUE_OR_TODO_RE.test(prompt)) {
+	if (!CONTINUE_OR_TODO_RE.test(core)) {
 		return null;
 	}
-	const keyword = extractProjectKeyword(prompt);
+	const keyword = extractProjectKeyword(core);
 	return {
 		kind: "general",
 		keyword,
@@ -165,6 +189,20 @@ function parseTkTaskLines(listOut: string): ParsedTask[] {
 }
 
 function buildTkContextSnapshot(intent: TkIntent, cwd: string, run: ExecRunner): string {
+	if (intent.kind === "wrap_up") {
+		const snap = collectHandoffSnapshot(intent.taskId, cwd, run);
+		if (!snap) return "";
+		return [
+			"[TK WRAP-UP & AUDIT CONTEXT]",
+			"セッションの区切り・終了指示に合わせて、`tk` と `git` の最新状態を事前取得しました（再度 `tk list` や `tk show` を叩き直す必要はありません）。",
+			"以下の監査・記録を実施して完了報告してください：",
+			"1. 今回の進捗・検証結果・残課題を対象タスクに `tk log <ID> --summary \"...\" --details \"...\" --next-action \"...\"` で記録する。",
+			"2. 新たに確定した判断（`decision`）・事実（`finding`）・ブロッカー（`blocker`）・問い（`question`）・仮説（`hypothesis`）があれば上記で得た `--log-id` を使って `tk record add` し、解消済みの既存 record があれば `tk record resolve` / `obsolete` / `--supersedes` で整理する。",
+			"3. タスク状態（`todo` / `in_progress` / `in_review` / `done`）を実態に合わせる。",
+			snap,
+		].join("\n\n");
+	}
+
 	const sections: string[] = [
 		"[TK HANDOFF CONTEXT]",
 		"ユーザーのタスク継続・確認指示に合わせて、`tk` と `git` の最新状態を事前取得しました（再度 `tk list` や `tk show` を叩き直す必要はありません。なお `tk task list` / `tk task show` というサブコマンドは存在しないため使わないでください）。",
@@ -241,10 +279,58 @@ function buildHandoffPrompt(userNote: string, snapshot: string): string {
 ${snapshot || "(取得なし)"}`;
 }
 
+function findTkCommandError(command: string): string | undefined {
+	if (!/\btk\b/.test(command)) return undefined;
+	const normalized = command.replace(/\\\n/g, " ").trim();
+	const segments = normalized.split(/(?:&&|\|\||;|\n|\$\()/).map((s) => s.trim()).filter(Boolean);
+	for (const seg of segments) {
+		const m = seg.match(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*tk\s+(.+)$/);
+		if (!m) continue;
+		const rest = m[1].trim();
+		if (!rest || /(?:^|\s)(?:--help|-h)(?:\s|$)/.test(rest)) continue;
+
+		if (/^(?:task|tasks)\b/.test(rest)) {
+			return "Invalid tk command (`tk task` does not exist). Use `tk list --all`, `tk show <id> --logs 8`, `tk add \"Title\" --description \"...\"`, or `tk status <id> <todo|in_progress|in_review|done>`.";
+		}
+		if (/^records\b/.test(rest)) {
+			return "Invalid tk command (`tk records` does not exist). Use `tk record list <task_id> [--kind X] [--all]` or `tk record add <task_id> --kind <kind> --log-id <log_id> --summary \"...\"`.";
+		}
+		if (/^(?:finding|decision|blocker|question|hypothesis)\b/.test(rest)) {
+			return "Invalid tk subcommand. Use `tk record add <task_id> --kind <decision|finding|blocker|question|hypothesis> --log-id <log_id> --summary \"...\" [--details \"...\"]`.";
+		}
+		if (/^record\s+supersede\b/.test(rest)) {
+			return "Invalid tk command (`tk record supersede` does not exist). Supersede by adding a new record with `--supersedes <old_record_id>`: `tk record add <task_id> --kind <kind> --log-id <log_id> --supersedes <old_record_id> --summary \"...\"`.";
+		}
+		if (/^record\s+list\b/.test(rest) && /(?:^|\s)--limit\b/.test(rest)) {
+			return "Invalid tk option (`tk record list` does not accept `--limit`). Use `tk record list <task_id> [--kind X] [--all]`.";
+		}
+		if (/^record\s+add\b/.test(rest)) {
+			if (/(?:^|\s)--title\b/.test(rest)) {
+				return "Invalid tk option (`tk record add` uses `--summary`, not `--title`). Syntax: `tk record add <task_id> --kind <decision|finding|blocker|question|hypothesis> --log-id <log_id> --summary \"...\" [--details \"...\"]`.";
+			}
+			const missing: string[] = [];
+			if (!/(?:^|\s)--kind(?:\s|=)/.test(rest)) missing.push("--kind");
+			if (!/(?:^|\s)--log-id(?:\s|=)/.test(rest)) missing.push("--log-id");
+			if (!/(?:^|\s)--summary(?:\s|=)/.test(rest)) missing.push("--summary");
+			if (missing.length > 0) {
+				return `Missing required option(s) ${missing.join(", ")} for \`tk record add\`. First create/get a log ID via \`tk log <task_id> --summary "..."\`, then run: \`tk record add <task_id> --kind <decision|finding|blocker|question|hypothesis> --log-id <log_id> --summary "..." [--details "..."]\`.`;
+			}
+		}
+		if (/^log\b(?!-|s\b)/.test(rest) && !/(?:^|\s)--summary(?:\s|=)/.test(rest)) {
+			return "Missing required option `--summary` for `tk log`. Syntax: `tk log <task_id> --summary \"...\" [--details \"...\"] [--next-action \"...\"]`.";
+		}
+		if (/^add\b/.test(rest) && !/(?:^|\s)--description(?:\s|=)/.test(rest)) {
+			return "Missing required option `--description` for `tk add`. Syntax: `tk add \"Title\" --description \"目的：...\\n前提：...\\n完了条件：...\\nNon Goal：...\" [--parent <id>]`.";
+		}
+	}
+	return undefined;
+}
+
 export const __test = {
 	detectTkIntent,
 	extractTaskId,
 	parseTkTaskLines,
 	buildTkContextSnapshot,
 	buildHandoffPrompt,
+	findTkCommandError,
 };

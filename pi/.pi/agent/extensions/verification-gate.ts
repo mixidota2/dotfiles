@@ -2,7 +2,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { existsSync, readFileSync } from "node:fs";
 import { basename, extname, isAbsolute, resolve } from "node:path";
 
-const MAX_AUTOMATIC_REMINDERS = 2;
+const MAX_AUTOMATIC_REMINDERS = 3;
+
+type DomainName = "backend" | "frontend" | "visualHtml" | "other";
 
 type Verification = {
 	command: string;
@@ -13,8 +15,12 @@ type Verification = {
 type GateState = {
 	dirty: boolean;
 	changedFiles: Set<string>;
-	touchedMarkdownFiles: Set<string>;
+	changedCodePaths: Set<string>;
+	touchedDocFiles: Set<string>;
 	mutationVersion: number;
+	domainDirty: Record<DomainName, number>;
+	domainVerified: Record<DomainName, number>;
+	lspProbedVersion: number;
 	verification?: Verification;
 	waiver?: string;
 	remindedVersion?: number;
@@ -37,12 +43,14 @@ export default function verificationGate(pi: ExtensionAPI): void {
 		updateStatus(ctx);
 	}
 
-	function markMutation(label: string, ctx: ExtensionContext): void {
+	function markMutation(label: string, ctx: ExtensionContext, domain: DomainName = "other", absCodePath?: string): void {
 		state.dirty = true;
 		state.mutationVersion += 1;
+		state.domainDirty[domain] = state.mutationVersion;
 		state.verification = undefined;
 		state.waiver = undefined;
 		if (label) state.changedFiles.add(label);
+		if (absCodePath) state.changedCodePaths.add(absCodePath);
 		updateStatus(ctx);
 	}
 
@@ -153,10 +161,23 @@ export default function verificationGate(pi: ExtensionAPI): void {
 			const path = String((event.input as { path?: unknown }).path ?? event.toolName);
 			const cwd = ctx?.cwd ?? process.cwd();
 			const absPath = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
-			if (isTargetMarkdownPath(absPath)) {
-				state.touchedMarkdownFiles.add(absPath);
+			if (isTargetDocPath(absPath)) {
+				state.touchedDocFiles.add(absPath);
 			}
-			markMutation(path, ctx);
+			const domain = classifyMutatedPath(absPath);
+			if (domain) {
+				const isCode = domain === "backend" || domain === "frontend";
+				markMutation(path, ctx, domain, isCode ? absPath : undefined);
+			}
+			return;
+		}
+
+		if (event.toolName === "lens_diagnostics" && !event.isError) {
+			state.evidenceCount += 1;
+			const src = String((event.input as { source?: unknown })?.source ?? "");
+			if (src === "lsp") {
+				state.lspProbedVersion = state.mutationVersion;
+			}
 			return;
 		}
 
@@ -170,17 +191,23 @@ export default function verificationGate(pi: ExtensionAPI): void {
 		if (!event.isError && isEvidenceBashCommand(command)) {
 			state.evidenceCount += 1;
 		}
-		if (isVerificationCommand(command)) {
+		const verifiedDomains = classifyVerificationCommand(command);
+		if (verifiedDomains.length > 0) {
 			state.verification = {
 				command,
 				passed: !event.isError,
 				mutationVersion: state.mutationVersion,
 			};
+			if (!event.isError) {
+				for (const d of verifiedDomains) {
+					state.domainVerified[d] = state.mutationVersion;
+				}
+			}
 			updateStatus(ctx);
 			return;
 		}
 
-		if (!event.isError && isMutatingCommand(command)) markMutation(`bash: ${shortCommand(command)}`, ctx);
+		if (!event.isError && isMutatingCommand(command)) markMutation(`bash: ${shortCommand(command)}`, ctx, "other");
 	});
 
 	pi.on("agent_before_settle", async (event, ctx) => {
@@ -188,8 +215,8 @@ export default function verificationGate(pi: ExtensionAPI): void {
 		if (event.outcome !== "completed" || !event.context.canContinue) return;
 		if (state.waiver) return;
 
-		if (state.touchedMarkdownFiles.size > 0 && state.docQualityRemindedVersion !== state.mutationVersion && state.reminderCount < MAX_AUTOMATIC_REMINDERS) {
-			const docFindings = collectTouchedMarkdownFindings(state.touchedMarkdownFiles);
+		if (state.touchedDocFiles.size > 0 && state.docQualityRemindedVersion !== state.mutationVersion && state.reminderCount < MAX_AUTOMATIC_REMINDERS) {
+			const docFindings = collectTouchedDocFindings(state.touchedDocFiles);
 			if (docFindings.hard.length > 0) {
 				state.docQualityRemindedVersion = state.mutationVersion;
 				state.reminderCount += 1;
@@ -289,8 +316,12 @@ function freshState(): GateState {
 	return {
 		dirty: false,
 		changedFiles: new Set<string>(),
-		touchedMarkdownFiles: new Set<string>(),
+		changedCodePaths: new Set<string>(),
+		touchedDocFiles: new Set<string>(),
 		mutationVersion: 0,
+		domainDirty: { backend: 0, frontend: 0, visualHtml: 0, other: 0 },
+		domainVerified: { backend: 0, frontend: 0, visualHtml: 0, other: 0 },
+		lspProbedVersion: 0,
 		reminderCount: 0,
 		userPrompt: "",
 		requiresEvidence: false,
@@ -302,16 +333,29 @@ function freshState(): GateState {
 	};
 }
 
+function getUnverifiedDomains(state: GateState): DomainName[] {
+	const missing: DomainName[] = [];
+	for (const d of ["backend", "frontend", "visualHtml", "other"] as const) {
+		if (state.domainDirty[d] > state.domainVerified[d]) {
+			missing.push(d);
+		}
+	}
+	return missing;
+}
+
 function isFreshPass(state: GateState): boolean {
-	return state.verification?.passed === true && state.verification.mutationVersion === state.mutationVersion;
+	if (!state.dirty) return false;
+	if (!state.verification || !state.verification.passed) return false;
+	return getUnverifiedDomains(state).length === 0;
 }
 
 function statusText(state: GateState): string {
 	if (!state.dirty) return "No file mutations recorded for the current task.";
 	if (state.waiver) return `Verification waived: ${state.waiver}`;
-	if (isFreshPass(state)) return `Fresh verification passed: ${state.verification!.command}`;
+	if (isFreshPass(state)) return `Fresh verification passed: ${state.verification?.command ?? "ok"}`;
 	if (state.verification && !state.verification.passed) return `Latest verification failed: ${state.verification.command}`;
-	return `Changes are not verified yet (${state.changedFiles.size || "unknown"} target(s)).`;
+	const missing = getUnverifiedDomains(state);
+	return `Changes are not verified yet (missing: ${missing.join(", ") || "check"}; ${state.changedFiles.size || "unknown"} target(s)).`;
 }
 
 function buildVerificationReminder(state: GateState): string {
@@ -319,13 +363,70 @@ function buildVerificationReminder(state: GateState): string {
 	const failure = state.verification && !state.verification.passed
 		? `\nThe latest verification command failed:\n${state.verification.command}\n`
 		: "";
-	return `[VERIFICATION GATE]\nChanges were made after the latest successful verification, so the task is not ready to finish.${failure}\nChanged targets:\n${changed}\n\nRun the smallest relevant deterministic check now (test, behavior smoke test, typecheck, lint, build, or equivalent). If it fails, fix the problem and rerun it. Report the exact command and result. Do not claim completion from an import/load check alone when behavior changed.`;
+	const missing = getUnverifiedDomains(state);
+	const domainHints: string[] = [];
+	if (missing.includes("backend")) {
+		domainHints.push("- Backend Python changes require backend verification (`uv run pytest`, `ruff check`, `ty check`) after the latest edit.");
+	}
+	if (missing.includes("frontend")) {
+		domainHints.push("- Frontend changes require frontend verification (`vitest` / `npm test`, `tsc` / `biome check`, or `npm run build`) after the latest edit — backend tests alone do not verify frontend files.");
+	}
+	if (missing.includes("visualHtml")) {
+		domainHints.push("- Visual HTML deliverable was edited: re-render and inspect it AFTER your final edit (e.g., headless Chrome `--screenshot` or `check_all.py`) so you never report completion with an unrendered last-minute fix.");
+	}
+	if (missing.includes("other")) {
+		domainHints.push("- Run the relevant deterministic test, behavior smoke test, syntax check, or build for the changed target(s).");
+	}
+	if (state.changedCodePaths.size > 0 && state.lspProbedVersion < state.mutationVersion) {
+		const samplePaths = [...state.changedCodePaths].slice(0, 6).map((p) => `"${p}"`).join(", ");
+		domainHints.push(`- Refresh pi-lens diagnostics on modified code files via \`lens_diagnostics({ source: "lsp", scope: "paths", paths: [${samplePaths}] })\` so stale cached errors do not remain on screen.`);
+	}
+	const hintBlock = domainHints.length > 0 ? `\nRequired checks before finishing:\n${domainHints.join("\n")}\n` : "";
+	return `[VERIFICATION GATE]\nChanges were made after the latest successful verification, so the task is not ready to finish.${failure}\nChanged targets:\n${changed}\n${hintBlock}\nIf any check fails, fix the problem and rerun it. Report the exact command and result. Do not claim completion from an import/load check alone when behavior changed.`;
+}
+
+function classifyMutatedPath(absPath: string): DomainName | null {
+	const normalized = absPath.replace(/\\/g, "/");
+	const ext = extname(normalized).toLowerCase();
+	if (ext === ".md") {
+		// Pure Markdown prose is audited by touchedDocFiles; skill packages still run skill validation if tests exist.
+		return normalized.includes("/skills-local/") ? "other" : null;
+	}
+	if (isVisualHtmlPath(normalized)) return "visualHtml";
+	if (ext === ".py" || basename(normalized) === "pyproject.toml") return "backend";
+	if (
+		(ext === ".tsx" || ext === ".jsx" || ext === ".css" || ext === ".scss" || ext === ".vue" || ext === ".svelte") ||
+		((ext === ".ts" || ext === ".js") && !normalized.includes("/.pi/agent/extensions/"))
+	) {
+		return "frontend";
+	}
+	return "other";
+}
+
+function classifyVerificationCommand(command: string): DomainName[] {
+	const normalized = command.replace(/\\\n/g, " ").replace(/\s+/g, " ").trim();
+	if (!normalized) return [];
+	const domains = new Set<DomainName>();
+	if (BACKEND_VERIFY_PATTERNS.some((p) => p.test(normalized))) {
+		domains.add("backend");
+		domains.add("other");
+	}
+	if (FRONTEND_VERIFY_PATTERNS.some((p) => p.test(normalized))) {
+		domains.add("frontend");
+		domains.add("other");
+	}
+	if (VISUAL_HTML_VERIFY_PATTERNS.some((p) => p.test(normalized))) {
+		domains.add("visualHtml");
+		domains.add("other");
+	}
+	if (VERIFICATION_PATTERNS.some((p) => p.test(normalized))) {
+		domains.add("other");
+	}
+	return [...domains];
 }
 
 function isVerificationCommand(command: string): boolean {
-	const normalized = command.replace(/\\\n/g, " ").replace(/\s+/g, " ").trim();
-	if (!normalized) return false;
-	return VERIFICATION_PATTERNS.some((pattern) => pattern.test(normalized));
+	return classifyVerificationCommand(command).length > 0;
 }
 
 function isMutatingCommand(command: string): boolean {
@@ -346,11 +447,27 @@ function shortCommand(command: string): string {
 	return oneLine.length <= 48 ? oneLine : `${oneLine.slice(0, 45)}…`;
 }
 
-const VERIFICATION_PATTERNS: RegExp[] = [
-	/(?:^|[;&|]\s*)(?:uv run\s+(?:--\S+(?:\s+\S+)?\s+)*)?(?:python(?:3)?\s+(?:-[A-Za-z]+\s+)*-m\s+)?(?:pytest|unittest)\b/i,
+const BACKEND_VERIFY_PATTERNS: RegExp[] = [
+	/(?:^|[;&|]\s*)(?:uv\s+run\s+(?:--\S+(?:\s+\S+)?\s+)*|uvx\s+)?(?:python(?:3)?\s+(?:-[A-Za-z]+\s+)*-m\s+)?(?:pytest|unittest)\b/i,
+	/(?:^|[;&|]\s*)(?:uv\s+run\s+(?:--\S+(?:\s+\S+)?\s+)*|uvx\s+|npx\s+)?(?:ruff\s+check|ty\s+check|mypy|pyright)\b/i,
+];
+
+const FRONTEND_VERIFY_PATTERNS: RegExp[] = [
 	/(?:^|[;&|]\s*)(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|check|lint|typecheck|build)\b/i,
-	/(?:^|[;&|]\s*)npx\s+(?:vitest|jest|tsc|eslint|biome)\b/i,
-	/(?:^|[;&|]\s*)(?:vitest|jest|eslint|ruff\s+check|mypy|pyright)\b/i,
+	/(?:^|[;&|]\s*)(?:npx|pnpm\s+exec|bunx)\s+(?:vitest|jest|tsc|eslint|(?:@biomejs\/)?biome|next\s+build|vite\s+build)\b/i,
+	/(?:^|[;&|]\s*)(?:vitest|jest|eslint|tsc\b|biome\s+(?:check|ci|lint))\b/i,
+];
+
+const VISUAL_HTML_VERIFY_PATTERNS: RegExp[] = [
+	/--headless\b[^\n]*--screenshot\b/i,
+	/\b(?:check_all\.py|check_deck\.py|check_layout\.mjs|snapshot\.py)\b/i,
+	/\b(?:playwright|puppeteer)\b[^\n]*(?:screenshot|pdf|test)/i,
+];
+
+const VERIFICATION_PATTERNS: RegExp[] = [
+	...BACKEND_VERIFY_PATTERNS,
+	...FRONTEND_VERIFY_PATTERNS,
+	...VISUAL_HTML_VERIFY_PATTERNS,
 	/(?:^|[;&|]\s*)node\s+--test\b/i,
 	/(?:^|[;&|]\s*)(?:\/bin\/)?(?:sh|bash|zsh)\s+-n\b/i,
 	/(?:^|[;&|]\s*)(?:cargo\s+(?:test|check|clippy)|go\s+(?:test|vet)|mix\s+(?:test|compile|format\s+--check-formatted))\b/i,
@@ -369,6 +486,8 @@ const MUTATION_PATTERNS: RegExp[] = [
 
 export const __test = {
 	isVerificationCommand,
+	classifyVerificationCommand,
+	classifyMutatedPath,
 	isMutatingCommand,
 	isSpecOrReasonQuery,
 	isProposalOnlyPrompt,
@@ -376,14 +495,30 @@ export const __test = {
 	hasEvidenceOrUnknownCitation,
 	needsEvidenceReminder,
 	inspectMarkdownQuality,
+	inspectHtmlQuality,
+	inspectUiCodeQuality,
 	isTargetMarkdownPath,
+	isTargetHtmlPath,
+	isVisualHtmlPath,
+	isTargetUiPath,
+	isTargetDocPath,
 };
 
 const PROHIBITED_DOC_PATTERNS: Array<[RegExp, string]> = [
 	[/失うもの/, "「失うもの」という不自然な定型表現は使わず、「トレードオフ」または自然な文（「その代わり〜」）に直してください。"],
 	[/使う人/, "「使う人」という相対呼称は使わず、具体的な役割名（売場構成企画部の担当者、事業部の担当者、需要予測Gなど）を主語にしてください。"],
 	[/解決の道筋/, "「解決の道筋」という表現は「解決策」に直してください。"],
+	[/後段/, "「後段」という曖昧な表現は使わず、「次の段階」「後半の処理」など具体的な処理名に直してください。"],
+	[/(?:(?<![上中下前後])段\s*[0-9０-９]+|第\s*[0-9０-９一二三四五六七八九十]+\s*段(?!(?:目|階|落)))/u, "工程や手順を「段1」「第1段」のように「段」で呼ばず、「ステップ1」「段階1」または具体的な処理名に直してください。"],
+	[/物差し/, "「物差し」という比喩表現は使わず、「評価基準」「比較軸」「指標」など対象領域の具体的な用語に直してください。"],
+	[/(?:ひと塊|一塊|塊として|の塊)/, "「塊」という曖昧な言い換えは使わず、「グループ」「まとまり」「区画」「モジュール」など具体的な名称に直してください。"],
+	[/に資する/, "「〜に資する」という硬い表現は避け、「〜に役立つ」「〜につながる」など素の動詞に直してください。"],
+	[/(?:まず結論から申し上げますと|いかがでしたでしょうか|と言っても過言ではない)/, "AI特有の定型枕・定型締めは削り、結論の文から直接書き始めてください。"],
 	[/^#{1,4}\s*(?:作るもの|設計の[0-9０-９一二三四五六七八九十]*つの柱|設計の柱)\s*$/, "「作るもの」「設計の柱」のような曖昧な見出しは避け、具体的な設計対象または標準見出しにしてください。"],
+];
+
+const PROHIBITED_UI_EXTRA_PATTERNS: Array<[RegExp, string]> = [
+	[/決めること\s*[:：]/, "画面ラベルに「決めること：」のようなメタ見出しを置かず、意思決定の目的の文だけを直接表示してください。"],
 ];
 
 const SUBJECTLESS_GOAL_PATTERN = /(?:流れが一通り|一通りローカルで動く|ローカルで動くこと|動くようにする)\s*[。．]?$/;
@@ -400,6 +535,80 @@ function isTargetMarkdownPath(filePath: string): boolean {
 		return false;
 	}
 	return true;
+}
+
+function isTargetHtmlPath(filePath: string): boolean {
+	if (!filePath || extname(filePath).toLowerCase() !== ".html") return false;
+	const normalized = filePath.replace(/\\/g, "/");
+	const name = basename(normalized).toLowerCase();
+	if (name === "template.html" || name === "index.html") return false;
+	if (normalized.includes("/node_modules/") || normalized.includes("/skills/") || normalized.includes("/skills-local/")) {
+		return false;
+	}
+	return /(?:^|\/)(?:memo|docs)\//.test(normalized);
+}
+
+function isVisualHtmlPath(filePath: string): boolean {
+	if (!isTargetHtmlPath(filePath)) return false;
+	const normalized = filePath.replace(/\\/g, "/");
+	// Daily retail-news HTML uses a fixed template and does not require headless screenshot verification.
+	if (normalized.includes("/memo/retail-news/")) return false;
+	return true;
+}
+
+function isTargetUiPath(filePath: string): boolean {
+	if (!filePath) return false;
+	const normalized = filePath.replace(/\\/g, "/");
+	const ext = extname(normalized).toLowerCase();
+	if (ext !== ".tsx" && ext !== ".jsx") return false;
+	if (
+		normalized.includes("/node_modules/") ||
+		normalized.includes("/tests/") ||
+		normalized.includes("/__tests__/") ||
+		/\.(?:test|spec)\.[jt]sx$/i.test(normalized)
+	) {
+		return false;
+	}
+	return true;
+}
+
+function isTargetDocPath(filePath: string): boolean {
+	return isTargetMarkdownPath(filePath) || isTargetHtmlPath(filePath) || isTargetUiPath(filePath);
+}
+
+function inspectUiCodeQuality(filePath: string, source: string): { hard: string[]; advisory: string[] } {
+	const cleaned = source
+		.replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " "))
+		.replace(/(^|[^:])\/\/[^\n]*/gm, "$1 ");
+	const lines = cleaned.split(/\r?\n/).map((text, idx) => ({ lineNo: idx + 1, text }));
+	const jpLines = lines.filter((item) => /[\u3040-\u30ff\u4e00-\u9faf]/.test(item.text));
+	const hard: string[] = [];
+	for (const [pattern, message] of [...PROHIBITED_DOC_PATTERNS, ...PROHIBITED_UI_EXTRA_PATTERNS]) {
+		if (pattern.source.startsWith("^#")) continue;
+		const matched = jpLines.filter((item) => pattern.test(item.text)).map((item) => `L${item.lineNo}`);
+		if (matched.length > 0) {
+			hard.push(`- ${filePath} (${matched.slice(0, 5).join(", ")}): ${message}`);
+		}
+	}
+	return { hard, advisory: [] };
+}
+
+function inspectHtmlQuality(filePath: string, html: string): { hard: string[]; advisory: string[] } {
+	const cleaned = html
+		.replace(/<!--[\s\S]*?-->/g, (m) => m.replace(/[^\n]/g, " "))
+		.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, (m) => m.replace(/[^\n]/g, " "))
+		.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, (m) => m.replace(/[^\n]/g, " "))
+		.replace(/<[^>]+>/g, " ");
+	const lines = cleaned.split(/\r?\n/).map((text, idx) => ({ lineNo: idx + 1, text }));
+	const hard: string[] = [];
+	for (const [pattern, message] of PROHIBITED_DOC_PATTERNS) {
+		if (pattern.source.startsWith("^#")) continue;
+		const matched = lines.filter((item) => pattern.test(item.text)).map((item) => `L${item.lineNo}`);
+		if (matched.length > 0) {
+			hard.push(`- ${filePath} (${matched.slice(0, 5).join(", ")}): ${message}`);
+		}
+	}
+	return { hard, advisory: [] };
 }
 
 function inspectMarkdownQuality(filePath: string, text: string): { hard: string[]; advisory: string[] } {
@@ -479,14 +688,18 @@ function extractMarkdownSection(
 	return out;
 }
 
-function collectTouchedMarkdownFindings(files: Set<string>): { hard: string[]; advisory: string[] } {
+function collectTouchedDocFindings(files: Set<string>): { hard: string[]; advisory: string[] } {
 	const hard: string[] = [];
 	const advisory: string[] = [];
 	for (const filePath of files) {
-		if (!isTargetMarkdownPath(filePath) || !existsSync(filePath)) continue;
+		if (!isTargetDocPath(filePath) || !existsSync(filePath)) continue;
 		try {
 			const text = readFileSync(filePath, "utf8");
-			const res = inspectMarkdownQuality(filePath, text);
+			const res = isTargetHtmlPath(filePath)
+				? inspectHtmlQuality(filePath, text)
+				: isTargetUiPath(filePath)
+					? inspectUiCodeQuality(filePath, text)
+					: inspectMarkdownQuality(filePath, text);
 			hard.push(...res.hard);
 			advisory.push(...res.advisory);
 		} catch {
@@ -499,7 +712,7 @@ function collectTouchedMarkdownFindings(files: Set<string>): { hard: string[]; a
 function buildMarkdownQualityReminder(findings: { hard: string[]; advisory: string[] }): string {
 	const items = [...findings.hard, ...findings.advisory].join("\n");
 	return `[DOCUMENT QUALITY GATE]
-作成・編集した Markdown 文書に、手戻りの原因になる禁止表現または主語欠落が検出されました：
+作成・編集した文書（Markdown / HTML）に、手戻りの原因になる禁止表現または主語欠落が検出されました：
 ${items}
 
 ユーザーへ完了報告する前に以下を実施して修正してください：
@@ -528,17 +741,39 @@ const EVIDENCE_TOOLS = new Set([
 ]);
 
 const SPEC_OR_REASON_PATTERNS: RegExp[] = [
-	/[?？]\s*$/,
-	/(?:使える|使えない|できる|できない|可能か|対応してる|対応している|サポートされ)/i,
-	/(?:なぜ|どうして|理由|原因|根拠|仕組み|仕様|どういうこと|本当|ほんと)/i,
-	/(?:どうすれば|どうしたら|対策|防ぐには|どのレベル|何を設定)/i,
-	/\b(?:why|how\s+does|can\s+i|is\s+it\s+possible|what\s+is\s+the\s+evidence|root\s+cause)\b/i,
+	/(?:使える(?:か|かどうか|の\b|\s*[?？])|使えない(?:か|の\b|\s*[?？])|できる(?:か|かどうか|の\s*[?？]|作りになって)|可能か|対応して(?:る|いる)(?:か|の|\s*[?？])?|サポートされ)/i,
+	/(?:なぜ|なんで|どうして|原因(?:は|を|が|って何)|根拠(?:は|を|って何)|どういう(?:根拠|仕組み|仕様|計算)|仕様(?:は|を|として)|どうやって(?:やってる|出してる|計算|動いて|取得))/i,
+	/(?:どう防ぐ|防ぐには|対策は|何を設定すれば|どの設定)/i,
+	/\b(?:why\s+(?:is|does|did)|how\s+does|can\s+i\s+use|is\s+it\s+(?:possible|supported)|what\s+is\s+the\s+evidence|root\s+cause)\b/i,
 ];
 
+const NON_EVIDENCE_CASUAL_OR_IMPL_ONLY_PATTERNS: RegExp[] = [
+	/^(?:続けて|つづけて|続き|進めて|よろしく|ありがとう)/i,
+	/(?:次やることは|何やるんだっけ|タスクの中身見せて)/i,
+];
+
+function extractCoreUserPrompt(prompt: string): string {
+	let core = prompt.trim();
+	core = core.split(/\n\[(?:TK HANDOFF|EVIDENCE|DESIGN PLAN|PROPOSAL-ONLY)/)[0] ?? core;
+	core = core.split(/\nRecent session excerpt:/)[0] ?? core;
+	const userReqMatch = core.match(/User request:\s*\n([\s\S]*?)(?:\n\nUse the recent\/current session excerpt|\n\n1\.)/);
+	if (userReqMatch?.[1]) {
+		core = userReqMatch[1];
+	}
+	return core.trim();
+}
+
 function isSpecOrReasonQuery(prompt: string): boolean {
-	const trimmed = prompt.trim();
-	if (trimmed.length < 6) return false;
-	return SPEC_OR_REASON_PATTERNS.some((pattern) => pattern.test(trimmed));
+	const core = extractCoreUserPrompt(prompt);
+	if (core.length < 6) return false;
+	if (NON_EVIDENCE_CASUAL_OR_IMPL_ONLY_PATTERNS.some((pattern) => pattern.test(core)) && !/(?:なぜ|なんで|どうして|原因|根拠|仕様)/.test(core)) {
+		return false;
+	}
+	// Strip implementation-request phrases like "できるようにして" / "できるだけ" before checking capability/reason patterns.
+	const sanitized = core
+		.replace(/できるように(?:して|する|したい|なれば)/g, "実装して")
+		.replace(/できるだけ/g, "なるべく");
+	return SPEC_OR_REASON_PATTERNS.some((pattern) => pattern.test(sanitized));
 }
 
 function isEvidenceBashCommand(command: string): boolean {

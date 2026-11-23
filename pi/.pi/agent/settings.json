@@ -12,7 +12,6 @@
   "packages": [
     "npm:pi-subagents",
     "npm:@juicesharp/rpiv-ask-user-question",
-    "npm:pi-goal-x",
     "npm:@gotgenes/pi-permission-system",
     "npm:pi-powerline-footer",
     "npm:pi-lens",
@@ -23,7 +22,22 @@
     "google-vertex/gemini-4-argon": "medium"
   },
   "subagents": {
+    "defaultInheritGlobalContext": true,
     "agentOverrides": {
+      "worker": {
+        "model": "google-vertex/gemini-4-argon",
+        "thinking": "medium"
+      },
+      "reviewer": {
+        "model": "google-vertex/gemini-4-carbon",
+        "thinking": "medium",
+        "acceptanceRole": "read-only"
+      },
+      "code-reviewer": {
+        "model": "google-vertex/gemini-4-carbon",
+        "thinking": "medium",
+        "acceptanceRole": "read-only"
+      },
       "delegate": {
         "model": "google-vertex/gemini-3.8-flash",
         "thinking": "low",
@@ -39,10 +53,10 @@
   },
   "lastChangelogVersion": "1.5.2",
   "extensionChangelogVersions": {
-    "{\"source\":\"npm:pi-subagents\",\"scope\":\"user\"}": "0.88.0",
-    "{\"source\":\"npm:@gotgenes/pi-permission-system\",\"scope\":\"user\"}": "42.0.0",
+    "{\"source\":\"npm:pi-subagents\",\"scope\":\"user\"}": "0.89.1",
+    "{\"source\":\"npm:@gotgenes/pi-permission-system\",\"scope\":\"user\"}": "42.2.0",
     "{\"source\":\"npm:pi-powerline-footer\",\"scope\":\"user\"}": "0.22.0",
-    "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}": "4.4.12",
-    "{\"source\":\"npm:@narumitw/pi-plan-mode\",\"scope\":\"user\"}": "0.60.0"
+    "{\"source\":\"npm:pi-lens\",\"scope\":\"user\"}": "4.5.1",
+    "{\"source\":\"npm:@narumitw/pi-plan-mode\",\"scope\":\"user\"}": "0.60.3"
   }
 }

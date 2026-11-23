@@ -1,6 +1,7 @@
 ---
 name: fact-checker
 description: Fresh-context specification and evidence auditor that verifies claims against codebase files, CLI warnings, docs, and primary web sources
+advertise: true
 tools: read, bash, web_search, web_fetch
 subagentOnlyExtensions: ../extensions/verification-gate.ts, ../extensions/web-tools/index.ts
 acceptanceRole: read-only

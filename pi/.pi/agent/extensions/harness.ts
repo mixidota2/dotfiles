@@ -8,7 +8,6 @@ const HOME = homedir();
 const MAX_RECENT_CHARS = 18_000;
 const MAX_RECENT_ENTRIES = 80;
 const MIN_CURRENT_SESSION_ENTRIES = 6;
-const MAX_FALLBACK_SESSION_FILES = 4;
 
 type HarnessCandidate = {
 	title: string;
@@ -279,14 +278,14 @@ function stringField(value: unknown): string {
 	return typeof value === "string" ? value.trim() : "";
 }
 
-function parseJsonObject(text: string): unknown {
+function parseJsonObject(text: string): Record<string, unknown> {
 	const trimmed = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
 	try {
-		return JSON.parse(trimmed);
+		return JSON.parse(trimmed) as Record<string, unknown>;
 	} catch {
 		const start = trimmed.indexOf("{");
 		const end = trimmed.lastIndexOf("}");
-		if (start >= 0 && end > start) return JSON.parse(trimmed.slice(start, end + 1));
+		if (start >= 0 && end > start) return JSON.parse(trimmed.slice(start, end + 1)) as Record<string, unknown>;
 		throw new Error(`Model did not return JSON: ${trimmed.slice(0, 300)}`);
 	}
 }
@@ -401,11 +400,51 @@ function listRecentJsonlFiles(dir: string, excludeFile: string | undefined, limi
 	}
 }
 
+function listRecentPiFilesAcrossWorkspaces(
+	homeDir: string,
+	excludeFiles: Set<string>,
+	limit: number,
+	maxAgeMs = 14 * 24 * 60 * 60 * 1000,
+): string[] {
+	const sessionsRoot = join(homeDir, ".pi", "agent", "sessions");
+	if (!existsSync(sessionsRoot)) return [];
+	const cutoff = Date.now() - maxAgeMs;
+	const candidates: Array<{ fullPath: string; mtimeMs: number }> = [];
+	try {
+		for (const wsEntry of readdirSync(sessionsRoot)) {
+			if (!wsEntry.startsWith("--") || wsEntry.startsWith("--private-tmp-hakaru-")) continue;
+			const wsDir = join(sessionsRoot, wsEntry);
+			try {
+				if (!statSync(wsDir).isDirectory()) continue;
+				for (const name of readdirSync(wsDir)) {
+					if (!name.endsWith(".jsonl") || name === "session.jsonl") continue;
+					const fullPath = join(wsDir, name);
+					if (excludeFiles.has(fullPath)) continue;
+					try {
+						const mtimeMs = statSync(fullPath).mtimeMs;
+						if (mtimeMs >= cutoff) candidates.push({ fullPath, mtimeMs });
+					} catch {
+						// Ignore unreadable session files.
+					}
+				}
+			} catch {
+				// Ignore unreadable workspace dirs.
+			}
+		}
+	} catch {
+		return [];
+	}
+	return candidates
+		.sort((a, b) => b.mtimeMs - a.mtimeMs)
+		.slice(0, limit)
+		.map((item) => item.fullPath);
+}
+
 function listRecentClaudeFilesAcrossProjects(
 	homeDir: string,
 	excludeFiles: Set<string>,
 	limit: number,
-	maxAgeMs = 7 * 24 * 60 * 60 * 1000,
+	maxAgeMs = 14 * 24 * 60 * 60 * 1000,
 ): string[] {
 	const projectsRoot = join(homeDir, ".claude", "projects");
 	if (!existsSync(projectsRoot)) return [];
@@ -413,6 +452,7 @@ function listRecentClaudeFilesAcrossProjects(
 	const candidates: Array<{ fullPath: string; mtimeMs: number }> = [];
 	try {
 		for (const projectEntry of readdirSync(projectsRoot)) {
+			if (projectEntry.startsWith("-private-tmp-hakaru-") || projectEntry === "-private-tmp") continue;
 			const projectDir = join(projectsRoot, projectEntry);
 			try {
 				if (!statSync(projectDir).isDirectory()) continue;
@@ -440,6 +480,35 @@ function listRecentClaudeFilesAcrossProjects(
 		.map((item) => item.fullPath);
 }
 
+function collectRecentToolFrictionSummary(files: string[]): string {
+	const counts = new Map<string, number>();
+	const bump = (label: string, n = 1) => counts.set(label, (counts.get(label) ?? 0) + n);
+
+	for (const file of files) {
+		try {
+			const raw = readFileSync(file, "utf8");
+			const webSearchHits = (raw.match(/allowedPartnerModelFeatures[^\n]*web_search/g) ?? []).length;
+			if (webSearchHits > 0) bump("Claude WebSearch 400 (Vertex org policy)", webSearchHits);
+			const sleepHits = (raw.match(/went to sleep mid-response/g) ?? []).length;
+			if (sleepHits > 0) bump("System sleep mid-response", sleepHits);
+			const dnsHits = (raw.match(/ENOTFOUND oauth2\.googleapis\.com/g) ?? []).length;
+			if (dnsHits > 0) bump("DNS ENOTFOUND oauth2.googleapis.com", dnsHits);
+			const tkHits = (raw.match(/Usage: tk\b/g) ?? []).length;
+			if (tkHits > 0) bump("tk CLI usage/syntax error", tkHits);
+			const partialEditHits = (raw.match(/PARTIAL APPLY|RETRYABLE — Edit/g) ?? []).length;
+			if (partialEditHits > 0) bump("Edit partial-apply / retryable mismatch", partialEditHits);
+			const modHits = (raw.match(/ModuleNotFoundError: No module named '[^']+'/g) ?? []).length;
+			if (modHits > 0) bump("Python ModuleNotFoundError", modHits);
+		} catch {
+			// Ignore unreadable files.
+		}
+	}
+
+	const entries = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+	if (entries.length === 0) return "";
+	return entries.map(([k, v]) => `- ${k}: ${v} occurrence(s)`).join("\n");
+}
+
 function collectRecentWorkspaceSessionsExcerpt(
 	cwd: string,
 	excludeSessionFile?: string,
@@ -447,17 +516,29 @@ function collectRecentWorkspaceSessionsExcerpt(
 	options?: { preferClaude?: boolean },
 ): string {
 	const preferClaude = Boolean(options?.preferClaude);
-	const piFiles = listRecentJsonlFiles(piSessionDirForCwd(cwd, homeDir), excludeSessionFile, preferClaude ? 2 : MAX_FALLBACK_SESSION_FILES);
+	const localPiFiles = listRecentJsonlFiles(piSessionDirForCwd(cwd, homeDir), excludeSessionFile, preferClaude ? 2 : 3);
+	const seenPi = new Set<string>(excludeSessionFile ? [excludeSessionFile, ...localPiFiles] : localPiFiles);
+	const crossPiFiles = listRecentPiFilesAcrossWorkspaces(homeDir, seenPi, 3);
+	const piFiles = [...localPiFiles, ...crossPiFiles];
+
 	const localClaudeFiles = listRecentJsonlFiles(claudeProjectDirForCwd(cwd, homeDir), excludeSessionFile, preferClaude ? 3 : 2);
-	const seen = new Set<string>(excludeSessionFile ? [excludeSessionFile, ...localClaudeFiles] : localClaudeFiles);
-	const crossProjectClaudeFiles = listRecentClaudeFilesAcrossProjects(homeDir, seen, preferClaude ? 4 : 1);
+	const seenClaude = new Set<string>(excludeSessionFile ? [excludeSessionFile, ...localClaudeFiles] : localClaudeFiles);
+	const crossProjectClaudeFiles = listRecentClaudeFilesAcrossProjects(homeDir, seenClaude, preferClaude ? 4 : 3);
 	const claudeFiles = [...localClaudeFiles, ...crossProjectClaudeFiles];
+
 	const files = preferClaude ? [...claudeFiles, ...piFiles] : [...piFiles, ...claudeFiles];
 	const blocks: string[] = [];
-	const perSessionChars = preferClaude ? 2_800 : 1_500;
-	const perSessionEntries = preferClaude ? 28 : 16;
-	const maxTotalChars = preferClaude ? 12_000 : 6_000;
+	const perSessionChars = preferClaude ? 2_400 : 1_600;
+	const perSessionEntries = preferClaude ? 24 : 16;
+	const maxTotalChars = preferClaude ? 12_000 : 8_000;
 	let totalChars = 0;
+
+	const frictionSummary = collectRecentToolFrictionSummary(files);
+	if (frictionSummary) {
+		const summaryBlock = `#### Cross-Session Tool & API Friction\n${frictionSummary}`;
+		blocks.push(summaryBlock);
+		totalChars += summaryBlock.length + 2;
+	}
 
 	for (const file of files) {
 		const tail = readJsonlTail(file, 48);
@@ -604,10 +685,16 @@ function buildRecentSessionExcerpt(
 	return joined.length > MAX_RECENT_CHARS ? joined.slice(joined.length - MAX_RECENT_CHARS) : joined;
 }
 
+function stripInjectedContracts(text: string): string {
+	return text
+		.split(/\n\[(?:TK HANDOFF CONTEXT|EVIDENCE CONTRACT|DESIGN PLAN MODE CONTRACT|PROPOSAL-ONLY BOUNDARY CONTRACT)\]/)[0]
+		?.trim() ?? text.trim();
+}
+
 function extractText(value: unknown): string {
-	if (typeof value === "string") return value.trim();
+	if (typeof value === "string") return stripInjectedContracts(value);
 	if (Array.isArray(value)) {
-		return value.map((item) => {
+		return stripInjectedContracts(value.map((item) => {
 			if (typeof item === "string") return item;
 			if (item && typeof item === "object") {
 				const obj = item as Record<string, unknown>;
@@ -617,12 +704,12 @@ function extractText(value: unknown): string {
 				}
 			}
 			return "";
-		}).filter(Boolean).join("\n").trim();
+		}).filter(Boolean).join("\n"));
 	}
 	if (value && typeof value === "object") {
 		const obj = value as Record<string, unknown>;
-		if (typeof obj.text === "string") return obj.text.trim();
-		if (typeof obj.content === "string") return obj.content.trim();
+		if (typeof obj.text === "string") return stripInjectedContracts(obj.text);
+		if (typeof obj.content === "string") return stripInjectedContracts(obj.content);
 	}
 	return "";
 }
@@ -635,6 +722,9 @@ export const __test = {
 	buildRecentContextExcerpt,
 	buildRecentSessionExcerpt,
 	collectRecentWorkspaceSessionsExcerpt,
+	collectRecentToolFrictionSummary,
+	listRecentPiFilesAcrossWorkspaces,
+	listRecentClaudeFilesAcrossProjects,
 	collectTkExcerpt,
 	getRecentEntries,
 	piSessionDirForCwd,
